@@ -162,6 +162,14 @@ GROQ_MIN_RATE_LIMIT_WAIT = float(os.environ.get("DOCSUM_GROQ_MIN_WAIT", "8"))
 # prompt problem and is not one.
 VERIFIED_MAX_TOKENS = int(os.environ.get("DOCSUM_VERIFIED_MAX_TOKENS", "4096"))
 
+# On truncation, the request is retried with the budget doubled, up to this many
+# times, capped at VERIFIED_MAX_TOKENS_CEILING. Found necessary on the full gold
+# set: a handful of documents genuinely need more than the 4096-token default
+# because they support many claims, and discarding them outright rather than
+# retrying was throwing away real documents to a fixable budget problem.
+VERIFIED_MAX_ESCALATIONS = int(os.environ.get("DOCSUM_VERIFIED_MAX_ESCALATIONS", "2"))
+VERIFIED_MAX_TOKENS_CEILING = int(os.environ.get("DOCSUM_VERIFIED_MAX_TOKENS_CEILING", "16384"))
+
 # Shortest quote the verified backend will accept. A two-character "quote"
 # matches somewhere in almost any document, so accepting one would inflate
 # citation_precision with matches that establish nothing.

@@ -173,31 +173,45 @@ def summarize_verified(
         f"[excerpt {i}]\n{chunk.text}" for i, chunk in enumerate(selected)
     )
 
-    try:
-        data = _post(
-            {
-            "model": model,
-            "messages": [
-                {"role": "system", "content": VERIFIED_SYSTEM_PROMPT},
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": VERIFIED_SYSTEM_PROMPT},
                 {"role": "user", "content": f"{excerpts}\n\n---\n\n{task}"},
-            ],
-            "temperature": 0,
-            "max_tokens": max_tokens,
-                "response_format": {"type": "json_object"},
-            },
-            timeout,
-        )
-    except RemoteError as exc:
-        # A truncated object fails JSON validation server-side with an empty
-        # failed_generation, which looks like a prompt fault. It is a budget
-        # fault: say so rather than sending the caller to rewrite the prompt.
-        if "json_validate_failed" in str(exc):
-            raise RemoteError(
-                f"the model's JSON was cut off at max_tokens={max_tokens}. "
-                f"Raise DOCSUM_VERIFIED_MAX_TOKENS (or pass max_tokens=) -- long "
-                f"documents need more room because each claim carries a full quote."
-            ) from exc
-        raise
+        ],
+        "temperature": 0,
+        "response_format": {"type": "json_object"},
+    }
+
+    # A truncated object fails JSON validation server-side with an empty
+    # failed_generation, which looks like a prompt fault and is a budget fault: a
+    # document with many claims needs more room than the default because every
+    # claim carries a full quote. Escalate the budget and retry rather than
+    # discard the document outright -- several documents in the full gold set
+    # legitimately need more than the 4096-token default.
+    budget = max_tokens
+    data = None
+    last_exc = None
+    for escalation in range(config.VERIFIED_MAX_ESCALATIONS + 1):
+        payload["max_tokens"] = budget
+        try:
+            data = _post(payload, timeout)
+            break
+        except RemoteError as exc:
+            last_exc = exc
+            truncated = "json_validate_failed" in str(exc)
+            if not truncated or escalation >= config.VERIFIED_MAX_ESCALATIONS:
+                if truncated:
+                    raise RemoteError(
+                        f"the model's JSON was still cut off at max_tokens={budget} "
+                        f"after {escalation + 1} attempt(s). Raise "
+                        f"VERIFIED_MAX_TOKENS_CEILING for documents this dense."
+                    ) from exc
+                raise
+            budget = min(budget * 2, config.VERIFIED_MAX_TOKENS_CEILING)
+
+    if data is None:
+        raise last_exc
 
     choice = data["choices"][0]
     claims = _parse_claims(choice["message"].get("content"))

@@ -837,7 +837,7 @@ def test_verified_backend() -> None:
 
     from docsum import config
     from docsum.chunking import chunk_text
-    from docsum.verified import _normalise, _parse_claims, locate_quote
+    from docsum.verified import _normalise, _parse_claims, locate_quote, summarize_verified
 
     source = ("A 52-year-old female patient presented with anterior neck swelling. "
               "She was managed with propylthiouracil 100 mg orally three times per day. "
@@ -896,6 +896,80 @@ def test_verified_backend() -> None:
               {"claim": "a", "quote": "b"}])
     check("a reasoning block is stripped before parsing",
           len(_parse_claims('<think>hmm</think>{"claims":[{"claim":"a","quote":"b"}]}')) == 1)
+
+    # -- truncation escalates the budget rather than discarding the document ---
+    # Found on the full gold set: several documents legitimately need more room
+    # than the default because they support many claims, and the original
+    # behaviour threw the whole document away on the first truncation.
+    import docsum.verified as verified_mod
+    from docsum.remote import RemoteError
+
+    real_post = verified_mod._post
+    ok_content = '{"claims":[]}'
+
+    def make_fake_post(fail_times, message="Groq returned 400: json_validate_failed"):
+        state = {"n": 0, "budgets": []}
+
+        def fake_post(payload, timeout):
+            state["n"] += 1
+            state["budgets"].append(payload["max_tokens"])
+            if state["n"] <= fail_times:
+                raise RemoteError(message)
+            return {
+                "choices": [{"message": {"content": ok_content}, "finish_reason": "stop"}],
+                "model": "test-model",
+                "usage": {"prompt_tokens": 10, "completion_tokens": 5},
+            }
+
+        return fake_post, state
+
+    fake, state = make_fake_post(fail_times=1)
+    verified_mod._post = fake
+    try:
+        summarize_verified(source, doc_id="t2", aspects="generic", chunks=chunks, max_tokens=100)
+        check("truncation triggers exactly one retry", state["n"] == 2, f"got {state['n']} calls")
+        check("the retry doubles the token budget",
+              state["budgets"] == [100, 200], f"got {state['budgets']}")
+    finally:
+        verified_mod._post = real_post
+
+    always_truncated, state2 = make_fake_post(fail_times=999)
+    verified_mod._post = always_truncated
+    try:
+        try:
+            summarize_verified(source, doc_id="t3", aspects="generic", chunks=chunks, max_tokens=100)
+            check("persistent truncation eventually raises", False, "no exception")
+        except RemoteError as exc:
+            check("persistent truncation eventually raises", True)
+            check("gives up after VERIFIED_MAX_ESCALATIONS + 1 attempts",
+                  state2["n"] == config.VERIFIED_MAX_ESCALATIONS + 1,
+                  f"made {state2['n']} attempts")
+            check("the error explains it is a budget problem", "cut off" in str(exc))
+    finally:
+        verified_mod._post = real_post
+
+    non_truncation, state3 = make_fake_post(fail_times=999, message="Groq returned 401")
+    verified_mod._post = non_truncation
+    try:
+        try:
+            summarize_verified(source, doc_id="t4", aspects="generic", chunks=chunks, max_tokens=100)
+            check("a non-truncation error is not retried", False, "no exception")
+        except RemoteError:
+            check("a non-truncation error is not retried", state3["n"] == 1,
+                  f"made {state3['n']} attempts")
+    finally:
+        verified_mod._post = real_post
+
+    near_ceiling, state4 = make_fake_post(fail_times=1)
+    verified_mod._post = near_ceiling
+    try:
+        summarize_verified(source, doc_id="t5", aspects="generic", chunks=chunks,
+                           max_tokens=config.VERIFIED_MAX_TOKENS_CEILING - 100)
+        check("budget escalation is capped at the ceiling",
+              state4["budgets"][1] == config.VERIFIED_MAX_TOKENS_CEILING,
+              f"got {state4['budgets']}")
+    finally:
+        verified_mod._post = real_post
 
 
 def main() -> int:
