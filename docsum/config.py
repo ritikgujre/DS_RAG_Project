@@ -37,11 +37,17 @@ CHUNK_OVERLAP_SENTENCES = 1
 
 # --- Retrieval ---------------------------------------------------------------
 
-# How many chunks each aspect query may contribute. Measured on the MultiClinSum
-# gold set: at 6, the sweep already reaches 100% chunk coverage on 59/59 typical
-# documents, but a 13k-char outlier lost two chunks -- one of them holding the
-# lab values. 8 closes that gap. Raise it if uploaded documents are long and
-# omission matters more than input tokens.
+# How many chunks each aspect query may contribute. On the full 592-document
+# MultiClinSum English gold set, only 7 documents have more chunks than this, and
+# the sweep returns every chunk for all but two of them -- so on a typical case
+# report retrieval is effectively a pass-through and does not decide quality.
+#
+# The two exceptions are the ones to watch, and they are why this is not simply
+# unbounded: gs_en_504 (32 chunks) retrieves 81%, and gs_en_296 (29 chunks)
+# retrieves just 34%. On documents that large the sweep is discarding most of the
+# source, and omission is already the dominant failure mode in this corpus
+# (31-54% against under 4% hallucination in the MTS-Dialog correlation study).
+# Raise TOP_K for long uploads where omission costs more than input tokens.
 TOP_K = 8
 
 # Weight of dense (embedding) score vs sparse (BM25) score in the hybrid rank.

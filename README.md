@@ -70,10 +70,16 @@ MMR fill that adds relevant-but-different sentences. That order is deliberate:
 the MTS-Dialog correlation study puts omission at 31–54% against hallucination
 below 4%, so coverage is the failure worth designing against.
 
-The trade is prose quality — it reads as a highlight reel. Measured on 30
-MultiClinSum English gold documents: ROUGE-1 0.342, ROUGE-L 0.219, with
-attribution coverage, citation integrity and numeric fidelity all 1.0 on every
-document.
+The trade is prose quality — it reads as a highlight reel. Measured on the
+**full 592-document MultiClinSum English gold set** (121s, 0.20s/doc): ROUGE-1
+0.328 (sd 0.091, median 0.318, range 0.050–0.755), ROUGE-L 0.207, 6.4 claims per
+summary.
+
+The result that matters is the other column: **attribution coverage, citation
+integrity and numeric fidelity were exactly 1.0 on all 592 documents, with zero
+invalid citations.** These are by-construction properties, so anything less would
+mean the offset arithmetic had broken somewhere in the corpus — this is the run
+that shows it does not.
 
 ```bash
 python cli.py summarize case.txt --backend extractive --aspects clinical
@@ -102,7 +108,7 @@ Override with `DOCSUM_LOCAL_MODEL`, and see the `LOCAL_*` knobs in
 python cli.py summarize case.txt --backend local --aspects clinical
 ```
 
-Measured against extractive on the same 12 MultiClinSum English gold documents
+Measured head-to-head on the same 12 MultiClinSum English gold documents
 (`cli.py compare`), which is the honest way to read this backend:
 
 | | extractive | local (Qwen3-8B) |
