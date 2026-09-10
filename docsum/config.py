@@ -58,6 +58,66 @@ DENSE_WEIGHT = 0.65
 MAX_TOKENS = 8000
 EFFORT = os.environ.get("DOCSUM_EFFORT", "high")
 
+# --- Summary length ----------------------------------------------------------
+
+# How hard the generative backends compress. The default task tells the model to
+# cover every substantive point, which is deliberate -- omission runs 31-54% in
+# the MTS-Dialog correlation study against under 4% hallucination, so coverage is
+# the failure worth designing against. But on a short document retrieval is a
+# pass-through, so "cover everything" over the whole source produces a reworded
+# restatement rather than a summary, which is not what a reader uploading one
+# document wants.
+#
+# Measured on multiclinsum_gs_en_1 (4,954 chars) with the local 8B backend:
+#
+#   preset     output   share of source   note
+#   full       2,015    41%               the historical default
+#   standard     ~900   ~18%
+#   brief         710   14%               gold reference is 695 chars (14%)
+#
+# Shorter costs attribution coverage -- a compressed sentence fuses several
+# source facts and aligns less cleanly (brief measured 70% coverage on that
+# document). That trade is the reason `full` remains the default everywhere the
+# evaluation numbers are quoted.
+LENGTH_PRESETS = {
+    "brief": (
+        "Write a brief abstract of the document these excerpts are drawn from. "
+        "Cover only the central presentation, key findings, diagnosis and "
+        "outcome. Aim for about 120 words."
+    ),
+    "standard": (
+        "Write a concise summary of the document these excerpts are drawn from. "
+        "Keep the clinically significant findings and drop routine detail. "
+        "Aim for about 250 words."
+    ),
+    "full": (
+        "Write a factual summary of the document these excerpts are drawn from. "
+        "Cover every substantive point the excerpts establish."
+    ),
+}
+
+# The default preset. `full` reproduces the behaviour every measured table in the
+# README describes, so changing it would invalidate those numbers.
+DEFAULT_LENGTH = os.environ.get("DOCSUM_LENGTH", "full")
+
+
+def length_instruction(length: str | None) -> str:
+    """Resolve a length preset name to the task string sent to the model."""
+    name = length or DEFAULT_LENGTH
+    try:
+        return LENGTH_PRESETS[name]
+    except KeyError:
+        raise ValueError(
+            f"unknown length {name!r} (use one of {', '.join(LENGTH_PRESETS)})"
+        ) from None
+
+
+# Extractive selects whole sentences rather than writing them, so it honours the
+# same control through a sentence cap instead of a prompt. Tuned so each preset
+# lands near the generative output at that setting; None means the ratio-based
+# default in EXTRACTIVE_RATIO applies.
+EXTRACTIVE_LENGTH_SENTENCES = {"brief": 4, "standard": 8, "full": None}
+
 # --- Extractive backend ------------------------------------------------------
 
 # Selects source sentences verbatim instead of generating prose, so attribution

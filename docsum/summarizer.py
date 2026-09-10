@@ -239,6 +239,7 @@ def summarize(
     doc_id: str = "doc",
     aspects: str | list[str] = "generic",
     instruction: str | None = None,
+    length: str | None = None,
     top_k: int = config.TOP_K,
     chunk_budget: int | None = None,
     index: ChunkIndex | None = None,
@@ -273,10 +274,7 @@ def summarize(
     if client is None:
         client = anthropic.Anthropic()
 
-    task = instruction or (
-        "Write a factual summary of the document these excerpts are drawn from. "
-        "Cover every substantive point the excerpts establish."
-    )
+    task = instruction or config.length_instruction(length)
 
     request = {
         "model": model,

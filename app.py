@@ -82,6 +82,10 @@ UPLOAD_PAGE = """<!doctype html>
       <label>Backend</label>
       <select name="backend">{backend_options}</select>
     </div>
+    <div class="field">
+      <label>Summary length</label>
+      <select name="length">{length_options}</select>
+    </div>
     <button type="submit" id="b">Summarise</button>
   </form>
   <p class="note">Retrieval runs locally on CPU. <b>Extractive</b> and <b>Local GPU</b>
@@ -108,8 +112,24 @@ BACKENDS = {
     "api": "Generated — Claude writes prose, needs an API key",
 }
 
+LENGTHS = {
+    "brief": "Brief — abstract, roughly 120 words",
+    "standard": "Standard — the significant findings, roughly 250 words",
+    "full": "Full — every substantive point, barely condensed",
+}
 
-def _render_upload(error: str = "", backend: str = "extractive") -> str:
+# The CLI and library default to `full`, because that is what every measured
+# table in the README describes and changing it would invalidate them. A reader
+# uploading a single document wants a summary, though, and `full` over a short
+# document reads as a reworded copy of it -- retrieval is a pass-through at that
+# size, so "cover everything" is applied to the whole source. So the web form
+# opens on `standard` instead. Both remain one dropdown apart.
+WEB_DEFAULT_LENGTH = "standard"
+
+
+def _render_upload(
+    error: str = "", backend: str = "extractive", length: str = WEB_DEFAULT_LENGTH
+) -> str:
     options = "".join(
         f'<option value="{name}"{" selected" if name == "generic" else ""}>{name}</option>'
         for name in sorted(ASPECT_PRESETS)
@@ -118,10 +138,15 @@ def _render_upload(error: str = "", backend: str = "extractive") -> str:
         f'<option value="{key}"{" selected" if key == backend else ""}>{label}</option>'
         for key, label in BACKENDS.items()
     )
+    lengths = "".join(
+        f'<option value="{key}"{" selected" if key == length else ""}>{label}</option>'
+        for key, label in LENGTHS.items()
+    )
     return UPLOAD_PAGE.format(
         error=f'<div class="err">{error}</div>' if error else "",
         aspect_options=options,
         backend_options=backends,
+        length_options=lengths,
         model=config.GEN_MODEL,
     )
 
@@ -145,26 +170,31 @@ async def do_summarize(
     file: UploadFile = File(...),
     aspects: str = Form("generic"),
     backend: str = Form("extractive"),
+    length: str = Form(WEB_DEFAULT_LENGTH),
 ) -> HTMLResponse:
     if backend not in BACKENDS:
         return HTMLResponse(_render_upload(f"Unknown backend {backend!r}."), status_code=400)
+    if length not in LENGTHS:
+        return HTMLResponse(
+            _render_upload(f"Unknown length {length!r}.", backend=backend), status_code=400
+        )
 
     name = Path(file.filename or "upload.txt").name
     suffix = Path(name).suffix.lower()
 
     if suffix not in ALLOWED_SUFFIXES:
         return HTMLResponse(
-            _render_upload(f"Unsupported file type {suffix or '(none)'}.", backend=backend), status_code=400
+            _render_upload(f"Unsupported file type {suffix or '(none)'}.", backend=backend, length=length), status_code=400
         )
 
     raw = await file.read()
     if len(raw) > MAX_UPLOAD_BYTES:
         return HTMLResponse(
-            _render_upload(f"File is {len(raw) / 1e6:.1f} MB; the limit is 25 MB.", backend=backend),
+            _render_upload(f"File is {len(raw) / 1e6:.1f} MB; the limit is 25 MB.", backend=backend, length=length),
             status_code=413,
         )
     if not raw:
-        return HTMLResponse(_render_upload("That file is empty.", backend=backend), status_code=400)
+        return HTMLResponse(_render_upload("That file is empty.", backend=backend, length=length), status_code=400)
 
     # PDF and DOCX parsing needs a real path; delete it as soon as text is out.
     with tempfile.TemporaryDirectory() as tmp:
@@ -174,7 +204,7 @@ async def do_summarize(
             text = read_document(path)
         except Exception as exc:
             return HTMLResponse(
-                _render_upload(f"Could not read that file: {exc}", backend=backend), status_code=400
+                _render_upload(f"Could not read that file: {exc}", backend=backend, length=length), status_code=400
             )
 
     if not text.strip():
@@ -187,15 +217,17 @@ async def do_summarize(
 
     try:
         if backend == "extractive":
-            result = summarize_extractive(text, doc_id=name, aspects=aspects)
+            result = summarize_extractive(text, doc_id=name, aspects=aspects, length=length)
         elif backend == "local":
-            result = summarize_local(text, doc_id=name, aspects=aspects)
+            result = summarize_local(text, doc_id=name, aspects=aspects, length=length)
         elif backend == "groq":
-            result = summarize_remote(text, doc_id=name, aspects=aspects)
+            result = summarize_remote(text, doc_id=name, aspects=aspects, length=length)
         elif backend == "verified":
+            # No length here: this backend emits a claim list rather than prose,
+            # and its task string is the thing its measurement is about.
             result = summarize_verified(text, doc_id=name, aspects=aspects)
         else:
-            result = summarize(text, doc_id=name, aspects=aspects)
+            result = summarize(text, doc_id=name, aspects=aspects, length=length)
     except Exception as exc:
         traceback.print_exc()
         # The SDK raises a bare TypeError when it cannot resolve credentials,
@@ -208,11 +240,12 @@ async def do_summarize(
                     "Set ANTHROPIC_API_KEY and restart, or choose the "
                     "extractive backend — it needs no key.",
                     backend=backend,
+                    length=length,
                 ),
                 status_code=503,
             )
         return HTMLResponse(
-            _render_upload("Summarisation failed — see the server log.", backend=backend),
+            _render_upload("Summarisation failed — see the server log.", backend=backend, length=length),
             status_code=500,
         )
 

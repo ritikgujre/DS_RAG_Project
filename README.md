@@ -188,6 +188,36 @@ export GROQ_API_KEY=gsk_...
 python cli.py summarize case.txt --backend groq --aspects clinical
 ```
 
+### Summary length
+
+The default task tells the model to cover every substantive point, and on a
+short document retrieval is a pass-through — so the model receives the whole
+source and is asked to keep all of it. The result is a reworded restatement
+rather than a summary, which surprises people using the web UI.
+
+`--length` (and `length=` in the library) controls this. Measured on
+`multiclinsum_gs_en_1`, 4,954 chars, whose gold reference is 695 chars (14%):
+
+| preset | extractive | local (8B) | attribution coverage |
+|---|---|---|---|
+| `brief` | 482 (10%) | 710 (14%) | 0.70 |
+| `standard` | 1,107 (22%) | 1,533 (31%) | 0.96 |
+| `full` *(default)* | 1,234 (25%) | 2,015 (41%) | 1.00 |
+
+Compression costs attribution coverage, which is the honest trade and the reason
+`full` stays the default: a compressed sentence fuses several source facts and
+aligns less cleanly, so fewer claims earn a span. **Every measured table in this
+README describes `full`.** The web form opens on `standard` instead, because a
+reader summarising one document wants a summary.
+
+`extractive` honours the same presets through a sentence cap rather than a
+prompt. `verified` ignores them — it emits a claim list, and its task string is
+the thing its measurement is about.
+
+```bash
+python cli.py summarize case.txt --backend local --aspects clinical --length brief
+```
+
 **On `numeric_fidelity`:** it compares numeric tokens, breaking composites on
 `/` at both ends, so a date reformatted from `31/05/2023` into "May 31, 2023" —
 or a diastolic `80` quoted from a `110/80` blood pressure — counts as supported.

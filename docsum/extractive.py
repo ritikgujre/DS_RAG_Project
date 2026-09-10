@@ -101,6 +101,7 @@ def summarize_extractive(
     top_k: int = config.TOP_K,
     chunk_budget: int | None = None,
     max_sentences: int | None = None,
+    length: str | None = None,
     index: ChunkIndex | None = None,
     chunks: list[Chunk] | None = None,
 ) -> SummaryResult:
@@ -144,7 +145,13 @@ def summarize_extractive(
     relevance = query_vecs @ sent_vecs.T
     similarity = sent_vecs @ sent_vecs.T
 
-    budget = max_sentences or _sentence_budget(len(candidates))
+    # An explicit max_sentences wins; otherwise a length preset maps to a cap,
+    # which is how this backend honours the same control the generative ones take
+    # as a prompt. `full` maps to None and falls through to the ratio default.
+    cap = max_sentences or config.EXTRACTIVE_LENGTH_SENTENCES.get(
+        length or config.DEFAULT_LENGTH
+    )
+    budget = cap or _sentence_budget(len(candidates))
     chosen = _select(relevance, similarity, budget)
 
     # Document order, not relevance order: sentences pulled out of sequence read

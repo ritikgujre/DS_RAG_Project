@@ -61,6 +61,7 @@ def cmd_summarize(args: argparse.Namespace) -> int:
                 top_k=args.top_k,
                 chunk_budget=args.chunk_budget,
                 max_sentences=args.max_sentences,
+                length=args.length,
             )
         elif args.backend == "groq":
             result = summarize_remote(
@@ -70,6 +71,7 @@ def cmd_summarize(args: argparse.Namespace) -> int:
                 top_k=args.top_k,
                 chunk_budget=args.chunk_budget,
                 model=args.groq_model,
+                length=args.length,
             )
         elif args.backend == "verified":
             result = summarize_verified(
@@ -88,6 +90,7 @@ def cmd_summarize(args: argparse.Namespace) -> int:
                 top_k=args.top_k,
                 chunk_budget=args.chunk_budget,
                 model=args.local_model,
+                length=args.length,
             )
         else:
             result = summarize(
@@ -97,6 +100,7 @@ def cmd_summarize(args: argparse.Namespace) -> int:
                 top_k=args.top_k,
                 chunk_budget=args.chunk_budget,
                 model=args.model,
+                length=args.length,
             )
 
         if args.format == "json":
@@ -207,7 +211,7 @@ def main() -> int:
     p_sum.add_argument("-n", type=int, default=1, help="how many dataset docs to run")
     p_sum.add_argument("--model", default=config.GEN_MODEL)
     p_sum.add_argument("--backend", default="api", choices=["api", "extractive", "local", "groq", "verified"],
-                       help="api: Claude with native citations (needs a key). "
+                       help="api: native citations (needs a key). "
                             "extractive: select source sentences verbatim, no key. "
                             "local: generate on a local GPU, ground spans by alignment. "
                             "groq: same, but generated remotely via Groq. "
@@ -218,6 +222,12 @@ def main() -> int:
                        help="model for --backend local")
     p_sum.add_argument("--max-sentences", type=int, default=None,
                        help="extractive backend: cap summary length in sentences")
+    p_sum.add_argument("--length", default=config.DEFAULT_LENGTH,
+                       choices=sorted(config.LENGTH_PRESETS),
+                       help="how hard to compress. full (default) covers every "
+                            "substantive point and is what the README's measured "
+                            "tables describe; brief targets ~120 words. Ignored "
+                            "by --backend verified, which lists claims.")
     p_sum.add_argument("--format", default="text", choices=["text", "json", "html"])
     p_sum.add_argument("--out", help="output path for --format html")
     p_sum.add_argument("--show-reference", action="store_true", help="print the dataset's gold summary too")
