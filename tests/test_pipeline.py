@@ -695,7 +695,7 @@ def test_remote_backend() -> None:
     import httpx
     from docsum import config
     from docsum.remote import (
-        RemoteError, _parse_reset, _retry_delay, _post, summarize_remote,
+        DailyQuotaExceeded, RemoteError, _parse_reset, _retry_delay, _post, summarize_remote,
     )
 
     # Groq reports reset windows in its own duration format, not seconds.
@@ -815,6 +815,73 @@ def test_remote_backend() -> None:
         except RemoteError:
             check("401 raises", True)
             check("401 is not retried", calls["n"] == 1, f"made {calls['n']} attempts")
+    finally:
+        httpx.post = real_post
+        if real_key is None:
+            os.environ.pop(config.GROQ_API_KEY_ENV, None)
+        else:
+            os.environ[config.GROQ_API_KEY_ENV] = real_key
+
+    # A daily-quota 429 (Groq: "tokens per day (TPD)") must fail fast with the
+    # real wait attached, not be absorbed into the per-minute retry loop. Found
+    # on the full gold-set run: GROQ_MAX_BACKOFF (tuned for the per-minute
+    # limit, 90s) was truncating a genuine 25-minute wait, so every retry hit
+    # the same exhausted daily bucket and failed identically 6 times -- turning
+    # one document into a 9-19 minute failure for nothing.
+    calls["n"] = 0
+
+    def daily_quota_hit(*a, **kw):
+        calls["n"] += 1
+        return httpx.Response(
+            429,
+            headers={"retry-after": "1513"},
+            text='{"error":{"message":"Rate limit reached... on tokens per day (TPD): '
+                 'Limit 200000, Used 198130, Requested 5372. Please try again in 25m12.864s."}}',
+            request=httpx.Request("POST", "http://x"),
+        )
+
+    os.environ[config.GROQ_API_KEY_ENV] = "not-a-real-key"
+    httpx.post = daily_quota_hit
+    try:
+        try:
+            _post({"model": "x", "messages": [{"role": "user", "content": "hi"}]}, timeout=5)
+            check("a daily-quota 429 raises", False, "no exception")
+        except DailyQuotaExceeded as exc:
+            check("a daily-quota 429 raises", True)
+            check("it fails on the first call, not after retrying",
+                  calls["n"] == 1, f"made {calls['n']} attempts")
+            check("the real wait is preserved, not truncated to GROQ_MAX_BACKOFF",
+                  abs(exc.retry_after - 1513) < 1, f"got {exc.retry_after}")
+        except RemoteError as exc:
+            check("a daily-quota 429 raises DailyQuotaExceeded specifically", False,
+                  f"raised generic RemoteError instead: {exc}")
+    finally:
+        httpx.post = real_post
+        if real_key is None:
+            os.environ.pop(config.GROQ_API_KEY_ENV, None)
+        else:
+            os.environ[config.GROQ_API_KEY_ENV] = real_key
+
+    # An unreasonably long reported wait must still be capped, or one bad
+    # response could stall a runner for days.
+    calls["n"] = 0
+
+    def daily_quota_absurd(*a, **kw):
+        calls["n"] += 1
+        return httpx.Response(
+            429, headers={"retry-after": "999999"},
+            text='{"error":{"message":"... tokens per day (TPD) ... try again in a while."}}',
+            request=httpx.Request("POST", "http://x"),
+        )
+
+    os.environ[config.GROQ_API_KEY_ENV] = "not-a-real-key"
+    httpx.post = daily_quota_absurd
+    try:
+        try:
+            _post({"model": "x", "messages": []}, timeout=5)
+        except DailyQuotaExceeded as exc:
+            check("an absurd daily wait is capped at GROQ_MAX_DAILY_WAIT",
+                  exc.retry_after == config.GROQ_MAX_DAILY_WAIT, f"got {exc.retry_after}")
     finally:
         httpx.post = real_post
         if real_key is None:

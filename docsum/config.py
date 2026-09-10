@@ -155,6 +155,15 @@ GROQ_MAX_BACKOFF = float(os.environ.get("DOCSUM_GROQ_MAX_BACKOFF", "90"))
 # Never retry a rate limit faster than this, whatever the header claims.
 GROQ_MIN_RATE_LIMIT_WAIT = float(os.environ.get("DOCSUM_GROQ_MIN_WAIT", "8"))
 
+# Ceiling on a single daily-quota wait (see DailyQuotaExceeded in remote.py).
+# Found the hard way: the model's 200,000-tokens/day cap reports waits of tens
+# of minutes, which GROQ_MAX_BACKOFF (tuned for the per-minute limit) was
+# silently truncating to 90s -- so every retry hit the same exhausted daily
+# bucket and failed identically, 6 times, for nothing. This ceiling exists only
+# to stop one report's wait from being absurd (multi-day); it is not meant to
+# bind in the normal case.
+GROQ_MAX_DAILY_WAIT = float(os.environ.get("DOCSUM_GROQ_MAX_DAILY_WAIT", "7200"))
+
 # The verified backend needs a bigger budget than the prose backends: it emits
 # every claim AND a full supporting quote, and gpt-oss spends reasoning tokens
 # from the same allowance. At 2048 the JSON is truncated mid-object and Groq

@@ -49,6 +49,25 @@ class RemoteError(RuntimeError):
     """A Groq request failed in a way the caller should see verbatim."""
 
 
+class DailyQuotaExceeded(RemoteError):
+    """The model's daily token budget is exhausted; retrying soon cannot help.
+
+    Distinct from an ordinary per-minute 429: that clears in well under a
+    minute and is worth retrying inside `_post`. A daily quota (Groq: "tokens
+    per day (TPD)") genuinely will not move for the duration the server
+    reports -- sometimes tens of minutes. Retrying inside `_post` against the
+    ordinary backoff ceiling just hits the same wall repeatedly and burns the
+    whole retry budget for nothing: this is what turned one document into a
+    9-19 minute failure on the full gold-set run. Raised immediately instead,
+    with the real wait attached, so a batch runner can decide how to wait
+    rather than this function blocking for however long that turns out to be.
+    """
+
+    def __init__(self, message: str, retry_after: float):
+        super().__init__(message)
+        self.retry_after = retry_after
+
+
 def _api_key() -> str:
     key = os.environ.get(config.GROQ_API_KEY_ENV)
     if not key:
@@ -185,6 +204,20 @@ def _post(payload: dict, timeout: float) -> dict:
 
         if response.status_code == 401:
             raise RemoteError("Groq rejected the API key (401).")
+
+        if response.status_code == 429:
+            body = response.text
+            if "tokens per day" in body.lower() or "(tpd)" in body.lower():
+                # Not the ordinary per-minute limit -- retrying against the short
+                # backoff ceiling here just hits the same wall repeatedly. Surface
+                # it immediately with the real wait so the caller can decide.
+                wait = _parse_reset(response.headers.get("retry-after"))
+                if wait is None:
+                    wait = _parse_reset(response.headers.get("x-ratelimit-reset-tokens"))
+                wait = min(wait, config.GROQ_MAX_DAILY_WAIT) if wait is not None else config.GROQ_MAX_DAILY_WAIT
+                raise DailyQuotaExceeded(
+                    f"Groq's daily token quota is exhausted: {body[:250]}", retry_after=wait,
+                )
 
         # Rate limits are the normal case for a batch run on the free tier, not
         # an error: wait out the window the server names rather than failing the
