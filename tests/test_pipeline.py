@@ -1,0 +1,485 @@
+"""Invariants the attribution feature depends on.
+
+Run with:
+    PYTHONPATH=. ./.venv/Scripts/python.exe tests/test_pipeline.py
+
+No API key required -- the generation step is exercised through a mock client
+that returns the documented citations response shape, so these tests check our
+offset arithmetic rather than the network.
+"""
+
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+from types import SimpleNamespace as NS
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from docsum.chunking import chunk_text, split_sentences
+from docsum.datasets import load_mts_dialog, load_multiclinsum
+from docsum.evaluate import citation_integrity, numeric_fidelity, rouge_l, rouge_n
+from docsum.extractive import summarize_extractive
+from docsum.summarizer import summarize
+
+PASS: list[str] = []
+FAIL: list[str] = []
+
+
+def check(name: str, condition: bool, detail: str = "") -> None:
+    (PASS if condition else FAIL).append(name)
+    status = "PASS" if condition else "FAIL"
+    print(f"  [{status}] {name}" + (f" -- {detail}" if detail and not condition else ""))
+
+
+# --- 1. Sentence splitting ---------------------------------------------------
+
+def test_sentence_splitting() -> None:
+    print("\nsentence splitting")
+    cases = [
+        # (text, expected sentence count)
+        ("Pt. is a 55 y.o. male seen by Dr. Smith on 07/29/2008. He improved.", 2),
+        ("Labs: CRP 3.21 mg/dL. AFP was <1.3 ng/mL. Normal.", 3),
+        ("He took 5 mg. daily without issue. Then it stopped.", 2),
+        ("Doctor: Any fever? \nPatient: No. \nDoctor: Good.", 3),
+        ("In Jan. 2009 she relapsed. Treatment resumed.", 2),
+        ("She was born in the U.S.A. and moved later. Dr. Lee agreed.", 2),
+        ("1. First item. 2. Second one. Then prose.", 3),
+    ]
+    for text, expected in cases:
+        sents = split_sentences(text)
+        check(f"{text[:44]!r} -> {expected} sentences",
+              len(sents) == expected, f"got {len(sents)}: {[s.text for s in sents]}")
+        # Offsets must be exact for every sentence.
+        exact = all(text[s.start : s.end] == s.text for s in sents)
+        check(f"  offsets exact for {text[:30]!r}", exact)
+
+
+# --- 2. Chunk offsets, the load-bearing invariant ----------------------------
+
+def test_chunk_offsets() -> None:
+    print("\nchunk offset invariant (source[c.start:c.end] == c.text)")
+    total = bad = 0
+    for lang in ("en", "es", "fr", "pt"):
+        for pair in load_multiclinsum("gs", lang, limit=50):
+            for c in chunk_text(pair.text, doc_id=pair.doc_id):
+                total += 1
+                if pair.text[c.start : c.end] != c.text:
+                    bad += 1
+    for split in ("train", "validation", "test1", "test2"):
+        for pair in load_mts_dialog(split, limit=100):
+            for c in chunk_text(pair.text, doc_id=pair.doc_id):
+                total += 1
+                if pair.text[c.start : c.end] != c.text:
+                    bad += 1
+    check(f"{total} chunks across 4 languages + 4 MTS splits", bad == 0, f"{bad} mismatched")
+
+
+def test_chunk_coverage() -> None:
+    print("\nchunk coverage")
+    pair = load_multiclinsum("gs", "en", limit=1)[0]
+    chunks = chunk_text(pair.text, doc_id=pair.doc_id)
+    check("first chunk starts at or near 0", chunks[0].start < 50)
+    check("last chunk reaches the end", chunks[-1].end == len(pair.text.rstrip()),
+          f"{chunks[-1].end} vs {len(pair.text)}")
+    gaps = [
+        (chunks[i].end, chunks[i + 1].start)
+        for i in range(len(chunks) - 1)
+        if chunks[i + 1].start > chunks[i].end
+    ]
+    check("no uncovered gaps between consecutive chunks", not gaps, str(gaps[:3]))
+
+
+# --- 3. Citation offset mapping ----------------------------------------------
+
+def _mock_client(cite_local: tuple[int, int] = (5, 45)):
+    """A client that cites a known local span out of every document block."""
+    captured: dict = {}
+
+    class Client:
+        class messages:
+            @staticmethod
+            def create(**kw):
+                docs = [
+                    b for b in kw["messages"][0]["content"] if b.get("type") == "document"
+                ]
+                captured["docs"] = docs
+                captured["request"] = kw
+                blocks = []
+                for di, d in enumerate(docs):
+                    data = d["source"]["data"]
+                    lo = min(cite_local[0], max(0, len(data) - 1))
+                    hi = min(cite_local[1], len(data))
+                    blocks.append(
+                        NS(
+                            type="text",
+                            text=f"claim about section {di} of the document ",
+                            citations=[
+                                NS(
+                                    type="char_location",
+                                    cited_text=data[lo:hi],
+                                    document_index=di,
+                                    document_title=d["title"],
+                                    start_char_index=lo,
+                                    end_char_index=hi,
+                                )
+                            ],
+                        )
+                    )
+                return NS(
+                    content=blocks,
+                    stop_reason="end_turn",
+                    stop_details=None,
+                    usage=NS(input_tokens=1, output_tokens=1),
+                )
+
+    return Client(), captured
+
+
+def test_request_shape() -> None:
+    print("\nrequest shape")
+    pair = load_multiclinsum("gs", "en", limit=1)[0]
+    client, captured = _mock_client()
+    summarize(pair.text, doc_id=pair.doc_id, aspects="clinical", client=client)
+
+    docs = captured["docs"]
+    req = captured["request"]
+    check("every chunk is its own document block", len(docs) >= 1)
+    check("citations enabled on every document block",
+          all(d["citations"] == {"enabled": True} for d in docs))
+    check("plain-text source type (yields char_location citations)",
+          all(d["source"]["type"] == "text" for d in docs))
+    check("adaptive thinking requested", req["thinking"] == {"type": "adaptive"})
+    check("no output_config.format (incompatible with citations)",
+          "format" not in req.get("output_config", {}))
+
+
+def test_citation_mapping_full() -> None:
+    print("\ncitation -> absolute offset mapping (all chunks sent)")
+    pair = load_multiclinsum("gs", "en", limit=1)[0]
+    client, _ = _mock_client()
+    result = summarize(pair.text, doc_id=pair.doc_id, aspects="clinical", client=client)
+
+    spans = result.all_spans()
+    check("citations were parsed", len(spans) > 0)
+    exact = all(pair.text[s.start : s.end] == s.cited_text for s in spans)
+    check(f"all {len(spans)} spans slice back to their cited_text", exact)
+    share, invalid = citation_integrity(result)
+    check("citation_integrity == 1.0", share == 1.0, f"{invalid} invalid")
+
+
+def test_citation_mapping_subset() -> None:
+    print("\ncitation mapping when retrieval sends a non-contiguous subset")
+    pairs = load_multiclinsum("gs", "en", limit=120)
+    pair = max(pairs, key=lambda p: len(p.text))
+    all_chunks = chunk_text(pair.text, doc_id=pair.doc_id)
+
+    client, captured = _mock_client()
+    result = summarize(
+        pair.text, doc_id=pair.doc_id, aspects="clinical",
+        chunk_budget=4, client=client,
+    )
+    selected = [c.index for c in result.chunks_used]
+    check("budget honoured", len(selected) == 4, str(selected))
+    check("subset is non-contiguous (test is meaningful)",
+          selected != list(range(len(selected))) or len(all_chunks) <= 4, str(selected))
+
+    exact = all(pair.text[s.start : s.end] == s.cited_text for s in result.all_spans())
+    check(f"document_index resolves to the Nth SELECTED chunk (subset {selected})", exact)
+
+
+def test_refusal_handling() -> None:
+    print("\nrefusal handling")
+
+    class RefusingClient:
+        class messages:
+            @staticmethod
+            def create(**kw):
+                return NS(
+                    content=[],
+                    stop_reason="refusal",
+                    stop_details=NS(type="refusal", category="test",
+                                    explanation="declined for testing"),
+                    usage=NS(input_tokens=1, output_tokens=0),
+                )
+
+    pair = load_multiclinsum("gs", "en", limit=1)[0]
+    result = summarize(pair.text, doc_id=pair.doc_id, client=RefusingClient())
+    check("refusal surfaced instead of crashing", result.refusal is not None)
+    check("refusal explanation captured", "declined" in (result.refusal or ""))
+    check("no phantom summary on refusal", result.summary == "")
+
+
+# --- 4. Metrics --------------------------------------------------------------
+
+def test_metrics() -> None:
+    print("\nmetrics")
+    check("rouge1 identical text -> 1.0", rouge_n("a b c", "a b c", 1)["f1"] == 1.0)
+    check("rouge1 disjoint text -> 0.0", rouge_n("a b c", "x y z", 1)["f1"] == 0.0)
+    check("rougeL respects order",
+          rouge_l("a b c", "c b a")["f1"] < rouge_l("a b c", "a b c")["f1"])
+
+    score, missing = numeric_fidelity("Patient is 29 and got 500 mg.",
+                                      "A 29-year-old given 500 mg daily.")
+    check("numeric_fidelity accepts faithful numbers", score == 1.0, str(missing))
+    score, missing = numeric_fidelity("Patient is 42 and got 750 mg.",
+                                      "A 29-year-old given 500 mg daily.")
+    check("numeric_fidelity flags invented numbers",
+          score == 0.0 and set(missing) == {"42", "750"}, str(missing))
+    score, _ = numeric_fidelity("WBC 10200", "WBC was 10,200 today")
+    check("numeric_fidelity normalises thousands separators", score == 1.0)
+
+    # -- composite numeric tokens (dates, ratios) -----------------------------
+    # A date reformatted between source and summary is not an invention. Before
+    # this was handled, "May 31, 2023" against a source of "31/05/2023" reported
+    # three fabricated numbers.
+    s, missing = numeric_fidelity("Seen on May 31, 2023.", "Visit dated 31/05/2023.")
+    check("numeric: reformatted date is not an invention", s == 1.0, f"missing {missing}")
+
+    s, _ = numeric_fidelity("Recorded 2023.", "dated 31/05/2023")
+    check("numeric: year from a composite date is supported", s == 1.0)
+
+    s, _ = numeric_fidelity("The day was 5.", "dated 31/05/2023")
+    check("numeric: zero-padded component matches unpadded", s == 1.0)
+
+    s, _ = numeric_fidelity("Diastolic was 80.", "BP was 110/80 mmHg")
+    check("numeric: component of a ratio is supported", s == 1.0)
+
+    s, _ = numeric_fidelity("Seen on 31/05/2023.", "Visit dated May 31, 2023.")
+    check("numeric: decomposition works in both directions", s == 1.0)
+
+    # -- what must STILL be caught -------------------------------------------
+    # Decimals and thousands separators must not be split, or real inventions
+    # slip through: "3.21" is not evidence for a claim of "21".
+    s, missing = numeric_fidelity("AFP was 21.", "CRP 3.21 mg/dL")
+    check("numeric: decimals are NOT decomposed", s == 0.0, f"got {s}, missing {missing}")
+
+    s, missing = numeric_fidelity("Platelets 200.", "WBC was 10,200")
+    check("numeric: thousands separators are NOT decomposed", s == 0.0,
+          f"got {s}, missing {missing}")
+
+    s, missing = numeric_fidelity("Platelets of 230,000/mm3.", "Platelets were normal.")
+    check("numeric: a genuinely invented value is still flagged", s == 0.0,
+          f"got {s}, missing {missing}")
+
+    # The real hallucination found on multiclinsum_gs_en_8 must stay caught.
+    doc8 = load_multiclinsum("gs", "en", limit=8)[7]
+    s, missing = numeric_fidelity(
+        "Laboratory results included platelets of 230,000/mm3.", doc8.text)
+    check("numeric: the gs_en_8 fabricated platelet count is still flagged",
+          "230,000" in missing, f"missing {missing}")
+
+
+# --- 5. Dataset loaders ------------------------------------------------------
+
+def test_loaders() -> None:
+    print("\ndataset loaders")
+    gs = load_multiclinsum("gs", "en")
+    # 592, not 593: the archive's `fulltext/` directory entry is not a document.
+    check("MultiClinSum gs/en has 592 pairs", len(gs) == 592, f"got {len(gs)}")
+    check("every gs pair has text and reference",
+          all(p.text and p.reference for p in gs))
+    check("summaries are shorter than fulltexts on average",
+          sum(len(p.reference) for p in gs) < sum(len(p.text) for p in gs))
+
+    for lang in ("es", "fr", "pt"):
+        pairs = load_multiclinsum("gs", lang, limit=10)
+        check(f"gs/{lang} loads (nested .zip in fr ignored)", len(pairs) == 10)
+
+    ls = load_multiclinsum("ls", "en", limit=5)
+    check("large-scale split loads from zip", len(ls) == 5)
+
+    mts = load_mts_dialog("train")
+    check("MTS-Dialog train has 1201 pairs", len(mts) == 1201, f"got {len(mts)}")
+    check("MTS section headers preserved",
+          all(p.meta.get("section_header") for p in mts[:50]))
+
+
+# --- 10. Extractive backend: attribution exact by construction ---------------
+
+def test_extractive_backend() -> None:
+    """The extractive backend's guarantees are structural, so assert them as such.
+
+    Selecting sentences verbatim should make integrity, numeric fidelity and
+    coverage exactly 1.0 -- not approximately. Anything less means a span is
+    being derived rather than copied, which is the bug this backend exists to
+    make impossible.
+    """
+    print()
+    print("extractive backend")
+
+    docs = load_multiclinsum("gs", "en", limit=3)
+    check("gold docs available for extractive test", len(docs) == 3)
+
+    for doc in docs:
+        result = summarize_extractive(doc.text, doc_id=doc.doc_id, aspects="clinical")
+        tag = doc.doc_id
+
+        check(f"{tag}: produced a summary", bool(result.summary.strip()))
+        check(f"{tag}: every block is grounded",
+              len(result.grounded_facts) == len(result.facts))
+        check(f"{tag}: no unattributed claims", not result.unattributed_claims)
+
+        spans = result.all_spans()
+        exact = all(doc.text[s.start : s.end] == s.cited_text for s in spans)
+        check(f"{tag}: every span re-slices to its cited text", exact)
+
+        integrity, invalid = citation_integrity(result)
+        check(f"{tag}: citation_integrity == 1.0", integrity == 1.0, f"got {integrity}")
+        check(f"{tag}: zero invalid citations", invalid == 0, f"got {invalid}")
+
+        fidelity, missing = numeric_fidelity(result.summary, doc.text)
+        check(f"{tag}: numeric_fidelity == 1.0 (nothing can be invented)",
+              fidelity == 1.0, f"missing {missing}")
+
+        check(f"{tag}: attribution coverage == 1.0", result.coverage == 1.0,
+              f"got {result.coverage}")
+
+        # Document order, and no sentence selected twice.
+        starts = [s.start for s in spans]
+        check(f"{tag}: spans emitted in document order", starts == sorted(starts))
+        check(f"{tag}: no duplicate spans", len(set(starts)) == len(starts))
+
+        # Selected sentences must come from chunks retrieval actually chose.
+        windows = [(c.start, c.end) for c in result.chunks_used]
+        inside = all(any(lo <= s.start and s.end <= hi for lo, hi in windows)
+                     for s in spans)
+        check(f"{tag}: every span lies inside a retrieved chunk", inside)
+
+    # Explicit budget is honoured.
+    doc = docs[0]
+    capped = summarize_extractive(doc.text, doc_id=doc.doc_id,
+                                  aspects="clinical", max_sentences=4)
+    check("max_sentences caps the summary", len(capped.facts) == 4,
+          f"got {len(capped.facts)}")
+
+    # Degenerate input must not raise.
+    empty = summarize_extractive("", doc_id="empty")
+    check("empty document returns an empty result",
+          empty.summary == "" and not empty.facts)
+
+
+# --- 11. Local backend: alignment replaces citations -------------------------
+
+def test_local_alignment() -> None:
+    """The local backend has no native citations, so grounding is inferred.
+
+    These check the inference itself -- no GPU and no language model involved.
+    The properties that matter: a real claim finds its span, a fabricated one
+    finds nothing, and a fluent paraphrase that changed a number is not waved
+    through just because it still reads like the source.
+    """
+    print()
+    print("local backend alignment")
+
+    from docsum import config
+    from docsum.chunking import Sentence, chunk_text, sentences_within
+    from docsum.local import _align, _containment, _strip_artifacts
+    from docsum.retrieval import _load_embedder
+
+    # Containment is asymmetric and specifics-sensitive.
+    check("containment: identical text -> 1.0",
+          _containment("the patient was given 100 mg", "the patient was given 100 mg") == 1.0)
+    check("containment: short claim inside a long source -> 1.0",
+          _containment("given 100 mg", "the patient was given 100 mg orally daily") == 1.0)
+    swapped = _containment("the patient was given 500 mg", "the patient was given 100 mg")
+    check("containment: a swapped dosage drops below 1.0", swapped < 1.0, f"got {swapped}")
+    check("containment: empty claim -> 0.0", _containment("", "anything") == 0.0)
+
+    # Generation artifacts must not survive into the summary.
+    check("strip: <think> block removed",
+          _strip_artifacts("<think>reasoning here</think>The patient improved.")
+          == "The patient improved.")
+    check("strip: lead-in removed",
+          _strip_artifacts("Here is the summary: The patient improved.")
+          == "The patient improved.")
+    check("strip: ordinary prose untouched",
+          _strip_artifacts("The patient improved.") == "The patient improved.")
+
+    # Alignment against a real document.
+    doc = load_multiclinsum("gs", "en", limit=1)[0]
+    chunks = chunk_text(doc.text, doc_id=doc.doc_id)
+    candidates = sentences_within(doc.text, chunks,
+                                  min_chars=config.EXTRACTIVE_MIN_SENTENCE_CHARS)
+    check("candidate pool is non-empty", len(candidates) > 3)
+
+    verbatim = candidates[2][0].text
+    fabricated = ("The spacecraft completed its orbital insertion burn and "
+                  "transmitted telemetry back to the ground station.")
+    generated = [
+        Sentence(verbatim, 0, len(verbatim)),
+        Sentence(fabricated, 0, len(fabricated)),
+    ]
+
+    aligned = _align(generated, candidates, _load_embedder(config.EMBED_MODEL))
+    check("alignment returns one entry per generated sentence", len(aligned) == 2)
+
+    # A sentence lifted straight from the source must ground to itself.
+    check("verbatim claim is grounded", len(aligned[0]) >= 1)
+    if aligned[0]:
+        span = aligned[0][0]
+        check("verbatim claim maps to the correct span",
+              doc.text[span.start:span.end] == verbatim)
+        check("verbatim claim scores near 1.0", span.support >= 0.9,
+              f"got {span.support}")
+        check("support score is recorded", span.support is not None)
+
+    # An off-topic claim must attach to nothing rather than its least-bad match.
+    check("fabricated claim is left uncited", aligned[1] == [],
+          f"got {[(s.start, s.support) for s in aligned[1]]}")
+
+    # Every emitted span must still re-slice exactly, as for every backend.
+    all_spans = [s for group in aligned for s in group]
+    check("every aligned span re-slices to its cited text",
+          all(doc.text[s.start:s.end] == s.cited_text for s in all_spans))
+    check("spans within a claim are in document order",
+          all(g == sorted(g, key=lambda s: s.start) for g in aligned))
+    check("no claim exceeds the support-span cap",
+          all(len(g) <= config.LOCAL_MAX_SUPPORT_SPANS for g in aligned))
+
+    # An unsupported claim must show up in the report surface, not vanish.
+    from docsum.summarizer import Fact, SummaryResult
+    result = SummaryResult(
+        summary=" ".join(s.text for s in generated),
+        facts=[Fact(text=s.text, sources=sp) for s, sp in zip(generated, aligned)],
+        chunks_used=chunks,
+        source_text=doc.text,
+    )
+    check("the fabricated claim is reported as unattributed",
+          len(result.unattributed_claims) == 1)
+    check("coverage is below 1.0 when a claim is unsupported",
+          result.coverage < 1.0, f"got {result.coverage}")
+    integrity, invalid = citation_integrity(result)
+    check("citation_integrity still 1.0 (spans are real slices)", integrity == 1.0)
+    check("no invalid citations", invalid == 0)
+
+
+def main() -> int:
+    print("=" * 74)
+    print("docsum pipeline invariants")
+    print("=" * 74)
+    for fn in (
+        test_sentence_splitting,
+        test_chunk_offsets,
+        test_chunk_coverage,
+        test_request_shape,
+        test_citation_mapping_full,
+        test_citation_mapping_subset,
+        test_refusal_handling,
+        test_metrics,
+        test_loaders,
+        test_extractive_backend,
+        test_local_alignment,
+    ):
+        fn()
+
+    print("\n" + "=" * 74)
+    print(f"{len(PASS)} passed, {len(FAIL)} failed")
+    if FAIL:
+        for name in FAIL:
+            print(f"  FAILED: {name}")
+    return 1 if FAIL else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
