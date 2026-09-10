@@ -1,6 +1,17 @@
-.venv/
+# Python bytecode
 __pycache__/
 *.pyc
+
+# Virtual environments
+.venv/
+venv/
+
+# Editor and backup files
+*.bak
+
+# Local caches and scratch space
 .cache/
 scratch/
+
+# Generated HTML reports
 *.html

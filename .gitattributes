@@ -1,3 +1,9 @@
 # Keep LF in the repository and in working copies on every platform.
 # Without this, Windows checkouts rewrite every line and diffs become noise.
 * text=auto eol=lf
+
+# Third-party corpora are redistributed byte-for-byte: no EOL normalisation,
+# so checksums against the upstream releases still match.
+15517617/** -text
+MTS-Dialog-main/** -text
+*.zip binary

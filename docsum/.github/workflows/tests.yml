@@ -1,0 +1,54 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.10 is the floor the anthropic 1.x SDK requires; 3.14 is what this
+        # was developed against.
+        python-version: ["3.10", "3.14"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          # CPU-only torch: CI has no GPU, and the default index would pull
+          # ~2GB of CUDA libraries that nothing here can use.
+          pip install --index-url https://download.pytorch.org/whl/cpu torch
+          pip install -r requirements.txt
+
+      - name: Import check
+        run: python -c "import docsum; print(docsum.__all__)"
+
+      - name: Run tests
+        env:
+          PYTHONPATH: .
+          # Xet transfers have failed with spurious disk-space errors; plain
+          # HTTP is the reliable path for the embedding model download.
+          HF_HUB_DISABLE_XET: "1"
+        run: python tests/test_pipeline.py
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - name: Byte-compile every module
+        run: python -m compileall -q docsum cli.py app.py tests
