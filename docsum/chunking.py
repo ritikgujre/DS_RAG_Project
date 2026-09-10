@@ -129,6 +129,43 @@ def split_sentences(text: str) -> list[Sentence]:
     return sentences
 
 
+def _split_oversized(sentence: Sentence, limit: int) -> list[Sentence]:
+    """Break a sentence that is longer than `limit` into pieces on whitespace.
+
+    Sentence boundaries normally bound chunk size, but nothing guarantees a
+    document has any. multiclinsum_gs_en_410 is 21,511 characters with 11
+    sentences, one of them 20,238 characters -- a repeated lab-value run joined
+    by commas, whose 535 periods are all decimals the splitter correctly refuses
+    to break on. Without a ceiling that yields a 20,000-character "citation",
+    which is useless as attribution even though every offset in it is correct.
+
+    Splits on whitespace so offsets stay exact and no word is cut in half.
+    """
+    if len(sentence.text) <= limit:
+        return [sentence]
+
+    pieces: list[Sentence] = []
+    start = 0
+    text = sentence.text
+    while start < len(text):
+        end = min(start + limit, len(text))
+        if end < len(text):
+            # Back off to the last space so the break lands between words.
+            space = text.rfind(" ", start + limit // 2, end)
+            if space > start:
+                end = space
+        piece = text[start:end]
+        lead = len(piece) - len(piece.lstrip())
+        body = piece.strip()
+        if body:
+            pieces.append(
+                Sentence(body, sentence.start + start + lead,
+                         sentence.start + start + lead + len(body))
+            )
+        start = end
+    return pieces
+
+
 def sentences_within(
     text: str, chunks: list[Chunk], min_chars: int = 0
 ) -> list[tuple[Sentence, int]]:
@@ -176,6 +213,12 @@ def chunk_text(
     if not sentences:
         return []
 
+    # Enforce a hard ceiling before grouping. A chunk is the unit of citation,
+    # so an unbounded one makes attribution technically correct and practically
+    # worthless.
+    ceiling = max(target_chars, config.CHUNK_MAX_CHARS)
+    sentences = [p for s in sentences for p in _split_oversized(s, ceiling)]
+
     chunks: list[Chunk] = []
     current: list[Sentence] = []
     index = 0
@@ -197,6 +240,17 @@ def chunk_text(
         index += 1
 
     for sentence in sentences:
+        # Enforce the ceiling before appending. Splitting oversized sentences is
+        # not enough on its own: the one-sentence overlap carries a large
+        # sentence into the next chunk, so two near-ceiling sentences would
+        # combine into a chunk of twice the limit.
+        if current and sentence.end - current[0].start > ceiling:
+            flush(current)
+            current = current[-overlap_sentences:] if overlap_sentences else []
+            # Overlap alone can already exceed the ceiling; drop it if so.
+            if current and sentence.end - current[0].start > ceiling:
+                current = []
+
         current.append(sentence)
         span = current[-1].end - current[0].start
         if span >= target_chars:

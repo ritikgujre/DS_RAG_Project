@@ -118,3 +118,30 @@ LOCAL_ALIGN_DENSE_WEIGHT = 0.5
 # support it; keep the near-ties, not just the argmax.
 LOCAL_MAX_SUPPORT_SPANS = 3
 LOCAL_SUPPORT_MARGIN = 0.08
+
+# --- Groq (remote) backend ---------------------------------------------------
+
+# Generates through Groq's OpenAI-compatible API, then grounds the result with
+# the same alignment the local backend uses. Groq has no citations feature, so
+# attribution here is recovered, not guaranteed -- see docsum/grounding.py.
+
+GROQ_BASE_URL = os.environ.get("GROQ_BASE_URL", "https://api.groq.com/openai/v1")
+GROQ_API_KEY_ENV = "GROQ_API_KEY"
+
+# gpt-oss-120b is roughly an order of magnitude larger than the 8B that fits in
+# 16GB of VRAM, and returns in about a second. It also puts its reasoning in a
+# separate response field rather than inline, so the summary arrives clean;
+# qwen3.6-27b on this endpoint leaks <think> blocks into the content instead.
+GROQ_MODEL = os.environ.get("DOCSUM_GROQ_MODEL", "openai/gpt-oss-120b")
+GROQ_MAX_TOKENS = int(os.environ.get("DOCSUM_GROQ_MAX_TOKENS", "2048"))
+GROQ_TIMEOUT = float(os.environ.get("DOCSUM_GROQ_TIMEOUT", "120"))
+
+# Hard ceiling on chunk size. Sentence boundaries usually bound this, but nothing
+# guarantees a document has any: one gold case report is 21k chars in 11
+# sentences, the longest 20,238 chars. A chunk is the unit of citation, so an
+# unbounded one makes attribution correct but useless.
+CHUNK_MAX_CHARS = 2400
+
+# Ceiling for the adaptive top_k in search_many. Bounded so a pathological
+# document cannot push every chunk into the prompt.
+TOP_K_MAX = 32

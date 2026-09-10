@@ -60,6 +60,10 @@ def _run_one(backend: str, doc: DocPair, aspects: str, index, chunks) -> Summary
         from .local import summarize_local
 
         return summarize_local(doc.text, **common)
+    if backend == "groq":
+        from .remote import summarize_remote
+
+        return summarize_remote(doc.text, **common)
     if backend == "api":
         from .summarizer import summarize
 

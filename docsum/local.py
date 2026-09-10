@@ -24,27 +24,20 @@ numbers actually occur in the document). Unlike the extractive backend, where
 both are 1.0 by construction, here they can fail -- and when they do, that is a
 real finding about the model rather than a bug.
 
-Alignment blends embedding similarity with lexical containment. Cosine alone
-rates a fluent paraphrase highly even when it swapped a dosage, because the
-sentence embedding barely moves; containment is what notices that the tokens
-carrying the specifics are absent. Clinical text needs both, for the same reason
-retrieval is hybrid.
-
-`SourceSpan.support` records the alignment score, so a reader can tell a
-near-verbatim restatement from a loose thematic match.
+The alignment itself lives in `docsum/grounding.py`, shared with the Groq
+backend so the two differ only in where the text came from, never in how a
+claim earns its citation.
 """
 
 from __future__ import annotations
 
-import re
 from functools import lru_cache
 
-import numpy as np
-
 from . import config
-from .chunking import Chunk, chunk_text, sentences_within, split_sentences
-from .retrieval import ChunkIndex, _load_embedder, _tokenize
-from .summarizer import ASPECT_PRESETS, Fact, SourceSpan, SummaryResult
+from .chunking import Chunk, chunk_text
+from .grounding import ground, strip_artifacts
+from .retrieval import ChunkIndex
+from .summarizer import ASPECT_PRESETS, SummaryResult
 
 # No citation instructions: this model is not asked to attribute anything, so
 # telling it to would only invite confident invention. Its whole job is to write
@@ -115,80 +108,6 @@ def _build_prompt(tokenizer, chunks: list[Chunk], task: str) -> str:
         )
 
 
-def _strip_artifacts(text: str) -> str:
-    """Remove reasoning blocks and lead-ins that instruct models still emit."""
-    text = re.sub(r"<think>.*?</think>", "", text, flags=re.S)
-    text = re.sub(r"^\s*(here is[^\n:]*:|here's[^\n:]*:|summary:)\s*", "", text, flags=re.I)
-    return text.strip()
-
-
-def _containment(generated: str, source: str) -> float:
-    """Share of the generated sentence's tokens that occur in the source span.
-
-    Deliberately asymmetric. The question is whether the claim is supported by
-    the source, not whether the two say the same amount -- a short claim drawn
-    from a long sentence is fully supported and should score as such.
-    """
-    gen = set(_tokenize(generated))
-    if not gen:
-        return 0.0
-    return len(gen & set(_tokenize(source))) / len(gen)
-
-
-def _align(generated: list, candidates: list, embedder) -> list[list[SourceSpan]]:
-    """Match each generated sentence to the source spans that support it."""
-    if not candidates or not generated:
-        return [[] for _ in generated]
-
-    gen_vecs = np.asarray(
-        embedder.encode(
-            [s.text for s in generated], normalize_embeddings=True,
-            show_progress_bar=False, batch_size=32,
-        )
-    )
-    src_vecs = np.asarray(
-        embedder.encode(
-            [s.text for s, _ in candidates], normalize_embeddings=True,
-            show_progress_bar=False, batch_size=32,
-        )
-    )
-    cosine = gen_vecs @ src_vecs.T
-
-    w = config.LOCAL_ALIGN_DENSE_WEIGHT
-    out: list[list[SourceSpan]] = []
-
-    for gi, gen_sentence in enumerate(generated):
-        scores = np.array([
-            w * cosine[gi, ci]
-            + (1.0 - w) * _containment(gen_sentence.text, candidates[ci][0].text)
-            for ci in range(len(candidates))
-        ])
-        best = float(scores.max())
-        if best < config.LOCAL_ALIGN_THRESHOLD:
-            out.append([])  # an unsupported claim -- surfaced, not hidden
-            continue
-
-        # A generated sentence often fuses two source facts, so keep every span
-        # close to the best one rather than only the single argmax.
-        keep = [
-            int(i) for i in np.argsort(-scores)[: config.LOCAL_MAX_SUPPORT_SPANS]
-            if scores[i] >= config.LOCAL_ALIGN_THRESHOLD
-            and scores[i] >= best - config.LOCAL_SUPPORT_MARGIN
-        ]
-        out.append([
-            SourceSpan(
-                cited_text=candidates[i][0].text,
-                chunk_index=candidates[i][1],
-                start=candidates[i][0].start,
-                end=candidates[i][0].end,
-                support=round(float(scores[i]), 4),
-            )
-            for i in sorted(keep, key=lambda i: candidates[i][0].start)
-        ])
-
-    return out
-
-
 def summarize_local(
     text: str,
     *,
@@ -243,25 +162,14 @@ def summarize_local(
 
     n_in = int(inputs["input_ids"].shape[1])
     completion = tokenizer.decode(generated[0][n_in:], skip_special_tokens=True)
-    summary = _strip_artifacts(completion)
+    summary = strip_artifacts(completion)
     if not summary:
         return SummaryResult(
             summary="", facts=[], chunks_used=selected, source_text=text,
             stop_reason="empty",
         )
 
-    # Ground it. Candidates are the sentences of the chunks the model actually
-    # saw: a claim cannot honestly be traced to text that was never sent to it.
-    candidates = sentences_within(
-        text, selected, min_chars=config.EXTRACTIVE_MIN_SENTENCE_CHARS
-    )
-    gen_sentences = split_sentences(summary)
-    aligned = _align(gen_sentences, candidates, _load_embedder(config.EMBED_MODEL))
-
-    facts = [
-        Fact(text=sentence.text, sources=spans)
-        for sentence, spans in zip(gen_sentences, aligned)
-    ]
+    facts = ground(summary, text, selected)
 
     return SummaryResult(
         summary=summary,

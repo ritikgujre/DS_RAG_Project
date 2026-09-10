@@ -102,12 +102,12 @@ def _read_pairs() -> list[tuple[dict, dict]]:
 def grounding_coverage(summary: str, source: str, embedder=None) -> tuple[float, float]:
     """Share of summary sentences that align to a source span, and mean support.
 
-    This is exactly the local backend's attribution step (`local._align`) applied
+    This is exactly the local backend's attribution step (`grounding.align`) applied
     as a measurement, which is what makes it testable against human scores: if
     the mechanism the backend relies on does not track human factuality, the
     attribution it produces is decoration.
     """
-    from .local import _align
+    from .grounding import align
 
     chunks = chunk_text(source, doc_id="src")
     candidates = sentences_within(source, chunks, min_chars=0)
@@ -115,7 +115,7 @@ def grounding_coverage(summary: str, source: str, embedder=None) -> tuple[float,
     if not generated or not candidates:
         return 0.0, 0.0
 
-    aligned = _align(generated, candidates, embedder or _load_embedder(config.EMBED_MODEL))
+    aligned = align(generated, candidates, embedder or _load_embedder(config.EMBED_MODEL))
     covered = sum(1 for spans in aligned if spans) / len(generated)
     supports = [s.support for spans in aligned for s in spans]
     return covered, float(np.mean(supports)) if supports else 0.0

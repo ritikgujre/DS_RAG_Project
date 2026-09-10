@@ -24,6 +24,32 @@ from docsum.summarizer import summarize
 
 PASS: list[str] = []
 FAIL: list[str] = []
+SKIP: list[str] = []
+
+
+def _corpora_present() -> bool:
+    """Whether the datasets are sitting beside the project.
+
+    They are large, separately licensed, and deliberately not in the repository,
+    so a fresh clone has the code but not the corpora. Those tests skip rather
+    than fail, which keeps `python tests/test_pipeline.py` meaningful in CI and
+    for anyone who just wants to check the build.
+    """
+    from docsum import config
+
+    return config.MULTICLINSUM_DIR.exists() and config.MTS_DIR.exists()
+
+
+CORPORA = _corpora_present()
+
+
+def need_corpora(test_name: str) -> bool:
+    """Record a skip and tell the caller to bail out."""
+    if CORPORA:
+        return False
+    SKIP.append(test_name)
+    print(f"  [SKIP] {test_name} -- corpora not present beside the project")
+    return True
 
 
 def check(name: str, condition: bool, detail: str = "") -> None:
@@ -58,6 +84,8 @@ def test_sentence_splitting() -> None:
 # --- 2. Chunk offsets, the load-bearing invariant ----------------------------
 
 def test_chunk_offsets() -> None:
+    if need_corpora("test_chunk_offsets"):
+        return
     print("\nchunk offset invariant (source[c.start:c.end] == c.text)")
     total = bad = 0
     for lang in ("en", "es", "fr", "pt"):
@@ -76,6 +104,8 @@ def test_chunk_offsets() -> None:
 
 
 def test_chunk_coverage() -> None:
+    if need_corpora("test_chunk_coverage"):
+        return
     print("\nchunk coverage")
     pair = load_multiclinsum("gs", "en", limit=1)[0]
     chunks = chunk_text(pair.text, doc_id=pair.doc_id)
@@ -137,6 +167,8 @@ def _mock_client(cite_local: tuple[int, int] = (5, 45)):
 
 
 def test_request_shape() -> None:
+    if need_corpora("test_request_shape"):
+        return
     print("\nrequest shape")
     pair = load_multiclinsum("gs", "en", limit=1)[0]
     client, captured = _mock_client()
@@ -155,6 +187,8 @@ def test_request_shape() -> None:
 
 
 def test_citation_mapping_full() -> None:
+    if need_corpora("test_citation_mapping_full"):
+        return
     print("\ncitation -> absolute offset mapping (all chunks sent)")
     pair = load_multiclinsum("gs", "en", limit=1)[0]
     client, _ = _mock_client()
@@ -169,6 +203,8 @@ def test_citation_mapping_full() -> None:
 
 
 def test_citation_mapping_subset() -> None:
+    if need_corpora("test_citation_mapping_subset"):
+        return
     print("\ncitation mapping when retrieval sends a non-contiguous subset")
     pairs = load_multiclinsum("gs", "en", limit=120)
     pair = max(pairs, key=lambda p: len(p.text))
@@ -189,6 +225,8 @@ def test_citation_mapping_subset() -> None:
 
 
 def test_refusal_handling() -> None:
+    if need_corpora("test_refusal_handling"):
+        return
     print("\nrefusal handling")
 
     class RefusingClient:
@@ -263,6 +301,10 @@ def test_metrics() -> None:
           f"got {s}, missing {missing}")
 
     # The real hallucination found on multiclinsum_gs_en_8 must stay caught.
+    if not CORPORA:
+        SKIP.append("test_metrics::gs_en_8 regression")
+        print("  [SKIP] gs_en_8 regression -- corpora not present")
+        return
     doc8 = load_multiclinsum("gs", "en", limit=8)[7]
     s, missing = numeric_fidelity(
         "Laboratory results included platelets of 230,000/mm3.", doc8.text)
@@ -273,6 +315,8 @@ def test_metrics() -> None:
 # --- 5. Dataset loaders ------------------------------------------------------
 
 def test_loaders() -> None:
+    if need_corpora("test_loaders"):
+        return
     print("\ndataset loaders")
     gs = load_multiclinsum("gs", "en")
     # 592, not 593: the archive's `fulltext/` directory entry is not a document.
@@ -305,6 +349,8 @@ def test_extractive_backend() -> None:
     being derived rather than copied, which is the bug this backend exists to
     make impossible.
     """
+    if need_corpora("test_extractive_backend"):
+        return
     print()
     print("extractive backend")
 
@@ -369,32 +415,34 @@ def test_local_alignment() -> None:
     finds nothing, and a fluent paraphrase that changed a number is not waved
     through just because it still reads like the source.
     """
+    if need_corpora("test_local_alignment"):
+        return
     print()
     print("local backend alignment")
 
     from docsum import config
     from docsum.chunking import Sentence, chunk_text, sentences_within
-    from docsum.local import _align, _containment, _strip_artifacts
+    from docsum.grounding import align, containment, strip_artifacts
     from docsum.retrieval import _load_embedder
 
     # Containment is asymmetric and specifics-sensitive.
     check("containment: identical text -> 1.0",
-          _containment("the patient was given 100 mg", "the patient was given 100 mg") == 1.0)
+          containment("the patient was given 100 mg", "the patient was given 100 mg") == 1.0)
     check("containment: short claim inside a long source -> 1.0",
-          _containment("given 100 mg", "the patient was given 100 mg orally daily") == 1.0)
-    swapped = _containment("the patient was given 500 mg", "the patient was given 100 mg")
+          containment("given 100 mg", "the patient was given 100 mg orally daily") == 1.0)
+    swapped = containment("the patient was given 500 mg", "the patient was given 100 mg")
     check("containment: a swapped dosage drops below 1.0", swapped < 1.0, f"got {swapped}")
-    check("containment: empty claim -> 0.0", _containment("", "anything") == 0.0)
+    check("containment: empty claim -> 0.0", containment("", "anything") == 0.0)
 
     # Generation artifacts must not survive into the summary.
     check("strip: <think> block removed",
-          _strip_artifacts("<think>reasoning here</think>The patient improved.")
+          strip_artifacts("<think>reasoning here</think>The patient improved.")
           == "The patient improved.")
     check("strip: lead-in removed",
-          _strip_artifacts("Here is the summary: The patient improved.")
+          strip_artifacts("Here is the summary: The patient improved.")
           == "The patient improved.")
     check("strip: ordinary prose untouched",
-          _strip_artifacts("The patient improved.") == "The patient improved.")
+          strip_artifacts("The patient improved.") == "The patient improved.")
 
     # Alignment against a real document.
     doc = load_multiclinsum("gs", "en", limit=1)[0]
@@ -411,7 +459,7 @@ def test_local_alignment() -> None:
         Sentence(fabricated, 0, len(fabricated)),
     ]
 
-    aligned = _align(generated, candidates, _load_embedder(config.EMBED_MODEL))
+    aligned = align(generated, candidates, _load_embedder(config.EMBED_MODEL))
     check("alignment returns one entry per generated sentence", len(aligned) == 2)
 
     # A sentence lifted straight from the source must ground to itself.
@@ -464,6 +512,8 @@ def test_metric_validation() -> None:
     especially the positional alignment, which has no join key and would fail
     silently if either file changed length.
     """
+    if need_corpora("test_metric_validation"):
+        return
     print()
     print("metric validation")
 
@@ -526,6 +576,87 @@ def test_metric_validation() -> None:
           "Spearman" in report and "HallucinationRate" in report)
 
 
+# --- 13. Robustness: chunk ceiling and adaptive retrieval --------------------
+
+def test_chunk_ceiling() -> None:
+    """A chunk is the unit of citation, so an unbounded one is useless.
+
+    Sentence boundaries usually bound chunk size, but nothing guarantees a
+    document has any: gs_en_410 is 21k characters across 11 sentences, the
+    longest 20,238 chars. Before the ceiling that produced a single 20,625-char
+    chunk -- every offset in it correct, and worthless as attribution.
+    """
+    if need_corpora("test_chunk_ceiling"):
+        return
+    print()
+    print("chunk ceiling")
+
+    from docsum import config
+    from docsum.chunking import chunk_text
+
+    # A document with no sentence boundaries at all.
+    runaway = ", ".join(f"value {i} was 3.2{i % 10} units" for i in range(600))
+    chunks = chunk_text(runaway, doc_id="runaway")
+    biggest = max(len(c.text) for c in chunks)
+    check("a document with no sentence breaks still chunks", len(chunks) > 1)
+    check("no chunk exceeds the ceiling", biggest <= config.CHUNK_MAX_CHARS,
+          f"biggest {biggest} > {config.CHUNK_MAX_CHARS}")
+    check("offsets stay exact after splitting an oversized sentence",
+          all(runaway[c.start:c.end] == c.text for c in chunks))
+    check("splitting does not cut mid-word",
+          all(not c.text.startswith(" ") and not c.text.endswith(" ") for c in chunks))
+
+    # The real document that motivated this.
+    doc = next(d for d in load_multiclinsum("gs", "en", limit=420)
+               if d.doc_id == "multiclinsum_gs_en_410")
+    ch = chunk_text(doc.text, doc_id=doc.doc_id)
+    big = max(len(c.text) for c in ch)
+    check("gs_en_410 no longer yields a 20k-char chunk", big <= config.CHUNK_MAX_CHARS,
+          f"biggest {big}")
+    check("gs_en_410 offsets still exact",
+          all(doc.text[c.start:c.end] == c.text for c in ch))
+
+    # Ordinary text must be unaffected.
+    normal = "The patient improved. She was discharged on day four. Follow-up was arranged."
+    check("short ordinary text is untouched by the ceiling",
+          len(chunk_text(normal, doc_id="n")) == 1)
+
+
+def test_adaptive_top_k() -> None:
+    """Long documents must not silently lose most of their source.
+
+    Omission already dominates hallucination in this corpus, so dropping two
+    thirds of a document at the retrieval stage is the worst failure available.
+    """
+    if need_corpora("test_adaptive_top_k"):
+        return
+    print()
+    print("adaptive top_k")
+
+    from docsum import config
+    from docsum.chunking import chunk_text
+    from docsum.retrieval import ChunkIndex
+    from docsum.summarizer import ASPECT_PRESETS
+
+    small = ChunkIndex(chunk_text("One. Two. Three.", doc_id="s"))
+    check("small documents keep the configured top_k",
+          small.effective_top_k(config.TOP_K, 8) == config.TOP_K)
+
+    docs = {d.doc_id: d for d in load_multiclinsum("gs", "en", limit=520)}
+    for name, floor in (("multiclinsum_gs_en_296", 0.9), ("multiclinsum_gs_en_504", 0.9)):
+        doc = docs[name]
+        chunks = chunk_text(doc.text, doc_id=name)
+        selected = ChunkIndex(chunks).build().search_many(
+            ASPECT_PRESETS["clinical"], top_k=config.TOP_K)
+        ratio = len(selected) / len(chunks)
+        check(f"{name} retrieves most of its source", ratio >= floor,
+              f"only {ratio:.0%} of {len(chunks)} chunks")
+
+    # The cap must still bind, or a pathological document floods the prompt.
+    huge = ChunkIndex([object()] * 5000)
+    check("effective_top_k is capped", huge.effective_top_k(config.TOP_K, 8) == config.TOP_K_MAX)
+
+
 def main() -> int:
     print("=" * 74)
     print("docsum pipeline invariants")
@@ -543,11 +674,14 @@ def main() -> int:
         test_extractive_backend,
         test_local_alignment,
         test_metric_validation,
+        test_chunk_ceiling,
+        test_adaptive_top_k,
     ):
         fn()
 
     print("\n" + "=" * 74)
-    print(f"{len(PASS)} passed, {len(FAIL)} failed")
+    tail = f", {len(SKIP)} skipped (corpora absent)" if SKIP else ""
+    print(f"{len(PASS)} passed, {len(FAIL)} failed" + tail)
     if FAIL:
         for name in FAIL:
             print(f"  FAILED: {name}")

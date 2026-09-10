@@ -120,6 +120,34 @@ class ChunkIndex:
             for i in order
         ]
 
+    def effective_top_k(self, top_k: int, n_queries: int) -> int:
+        """Raise `top_k` when the document is too large for the sweep to cover.
+
+        On the full MultiClinSum gold set the sweep returns every chunk for all
+        but two documents, so on a typical case report this changes nothing. The
+        exceptions are the ones that matter: gs_en_296 (29 chunks) retrieved 34%
+        of itself and gs_en_504 (32 chunks) 81%, i.e. the retrieval stage was
+        discarding most of the source on exactly the documents with the most to
+        lose. Omission already dominates hallucination in this corpus, so
+        silently dropping two thirds of a long document is the worst failure
+        available.
+
+        Documents larger than TOP_K_MAX chunks (~38k characters) still lose
+        material here. That is the point at which a document genuinely needs
+        map-reduce, which this project does not implement -- the cap makes the
+        loss bounded and visible rather than silent.
+        """
+        if not self.chunks:
+            return top_k
+        if len(self.chunks) <= top_k:
+            return top_k
+        # Aspect queries overlap heavily -- on gs_en_296 eight queries at top_k=8
+        # returned a union of only 10 distinct chunks out of 29, so scaling by
+        # query count (which would give ceil(29/8)=4) raises nothing at all.
+        # Give each query the whole document to rank instead, bounded so a
+        # pathological input cannot push unlimited text into the prompt.
+        return min(len(self.chunks), config.TOP_K_MAX)
+
     def search_many(
         self, queries: list[str], top_k: int = config.TOP_K, budget: int | None = None
     ) -> list[Chunk]:
@@ -131,6 +159,7 @@ class ChunkIndex:
         order reads as disconnected facts.
         """
         best: dict[int, float] = {}
+        top_k = self.effective_top_k(top_k, len(queries))
         for query in queries:
             for hit in self.search(query, top_k=top_k):
                 key = hit.chunk.index
