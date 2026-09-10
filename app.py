@@ -20,6 +20,7 @@ from docsum.datasets import read_document
 from docsum.extractive import summarize_extractive
 from docsum.local import summarize_local
 from docsum.remote import summarize_remote
+from docsum.verified import summarize_verified
 from docsum.report import to_html
 from docsum.summarizer import ASPECT_PRESETS, summarize
 
@@ -103,6 +104,7 @@ BACKENDS = {
     "extractive": "Extractive — verbatim source sentences, no API key",
     "local": "Local GPU — prose from a local model, spans aligned after",
     "groq": "Groq — prose from a hosted model, spans aligned after",
+    "verified": "Verified — the model cites, every quote is checked",
     "api": "Generated — Claude writes prose, needs an API key",
 }
 
@@ -190,6 +192,8 @@ async def do_summarize(
             result = summarize_local(text, doc_id=name, aspects=aspects)
         elif backend == "groq":
             result = summarize_remote(text, doc_id=name, aspects=aspects)
+        elif backend == "verified":
+            result = summarize_verified(text, doc_id=name, aspects=aspects)
         else:
             result = summarize(text, doc_id=name, aspects=aspects)
     except Exception as exc:

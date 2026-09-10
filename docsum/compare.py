@@ -64,6 +64,10 @@ def _run_one(backend: str, doc: DocPair, aspects: str, index, chunks) -> Summary
         from .remote import summarize_remote
 
         return summarize_remote(doc.text, **common)
+    if backend == "verified":
+        from .verified import summarize_verified
+
+        return summarize_verified(doc.text, **common)
     if backend == "api":
         from .summarizer import summarize
 

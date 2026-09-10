@@ -707,16 +707,40 @@ def test_remote_backend() -> None:
     check("unparseable reset returns None", _parse_reset("nonsense") is None)
     check("missing reset returns None", _parse_reset(None) is None)
 
-    # The server's stated wait is preferred over guessing, and always capped.
-    resp = httpx.Response(429, headers={"x-ratelimit-reset-tokens": "2s"})
-    delay = _retry_delay(resp, attempt=0)
-    check("retry delay follows the server's reset header", 2.0 <= delay <= 2.6,
-          f"got {delay}")
+    # The server's stated wait is preferred over guessing, but floored. Groq's
+    # bucket refills continuously, so an exhausted budget can still report a
+    # sub-second reset while nowhere near a request's worth of tokens exists.
+    # Honouring that literally burns the whole retry budget in seconds.
+    long_reset = httpx.Response(429, headers={"x-ratelimit-reset-tokens": "40s"})
+    delay = _retry_delay(long_reset, attempt=0)
+    check("retry delay follows the server's reset header when it is long enough",
+          40.0 <= delay <= 40.6, f"got {delay}")
+    short = _retry_delay(httpx.Response(429, headers={"x-ratelimit-reset-tokens": "630ms"}), 0)
+    check("a sub-second reset is floored, not honoured literally",
+          short >= config.GROQ_MIN_RATE_LIMIT_WAIT, f"got {short}")
     capped = _retry_delay(httpx.Response(429, headers={"retry-after": "99999"}), 0)
     check("retry delay is capped", capped <= config.GROQ_MAX_BACKOFF, f"got {capped}")
     blind = _retry_delay(httpx.Response(500), attempt=3)
     check("falls back to exponential backoff with no headers", 8.0 <= blind <= 9.1,
           f"got {blind}")
+
+    # Pacing must be inert until the server has told us the budget, and must
+    # never fire when there is ample capacity.
+    from docsum.remote import _BUDGET, _pace
+    import time as _time
+
+    saved_budget = dict(_BUDGET)
+    try:
+        _BUDGET.clear()
+        t0 = _time.monotonic(); _pace(5000)
+        check("pacing does nothing before any budget is known",
+              _time.monotonic() - t0 < 0.5)
+        _BUDGET.update({"limit": 8000.0, "remaining": 7900.0, "at": _time.monotonic()})
+        t0 = _time.monotonic(); _pace(1000)
+        check("pacing does nothing when capacity is ample",
+              _time.monotonic() - t0 < 0.5)
+    finally:
+        _BUDGET.clear(); _BUDGET.update(saved_budget)
 
     # A missing key must explain itself and name the backends that need nothing.
     saved = os.environ.pop(config.GROQ_API_KEY_ENV, None)
@@ -799,6 +823,81 @@ def test_remote_backend() -> None:
             os.environ[config.GROQ_API_KEY_ENV] = real_key
 
 
+# --- 15. Verified backend: catching fabricated citations --------------------
+
+def test_verified_backend() -> None:
+    """Quote verification is what stands between this backend and prompt-engineering.
+
+    If `locate_quote` accepts something the model invented, the backend produces
+    exactly the authoritative-looking fiction the whole project exists to avoid.
+    So the interesting cases are the rejections, not the matches.
+    """
+    print()
+    print("verified backend")
+
+    from docsum import config
+    from docsum.chunking import chunk_text
+    from docsum.verified import _normalise, _parse_claims, locate_quote
+
+    source = ("A 52-year-old female patient presented with anterior neck swelling. "
+              "She was managed with propylthiouracil 100 mg orally three times per day. "
+              "After 2 weeks of steroid treatment the patient improved markedly.")
+    chunks = chunk_text(source, doc_id="t")
+
+    # A real quote resolves to its exact span.
+    quote = "managed with propylthiouracil 100 mg orally three times per day"
+    found = locate_quote(quote, chunks)
+    check("a genuine quote is located", found is not None)
+    if found:
+        _, start, end = found
+        check("located span slices back to the quote", source[start:end] == quote,
+              f"got {source[start:end]!r}")
+
+    # The whole point: an invented quote must be rejected.
+    check("a fabricated quote is rejected",
+          locate_quote("treated with amoxicillin 500 mg twice daily", chunks) is None)
+    check("a plausible-but-absent dosage is rejected",
+          locate_quote("propylthiouracil 250 mg orally three times per day", chunks) is None)
+    check("text from another document is rejected",
+          locate_quote("The spacecraft completed its orbital insertion burn", chunks) is None)
+
+    # Formatting differences are not fabrication. Models rewrite hyphens and
+    # spaces constantly -- gpt-oss-120b emits U+2011 and U+202F routinely -- and
+    # failing those would measure the tokenizer rather than the model.
+    check("a re-wrapped quote still matches",
+          locate_quote("managed with propylthiouracil 100 mg\n  orally three times per day",
+                       chunks) is not None)
+    check("a non-breaking hyphen still matches",
+          locate_quote("A 52‑year‑old female patient", chunks) is not None)
+    check("a narrow no-break space still matches",
+          locate_quote("propylthiouracil 100 mg orally", chunks) is not None)
+
+    # Normalisation must not shift any character position, or every span breaks.
+    typographic = "A 52‑year‑old patient “improved”"
+    check("normalisation preserves length exactly",
+          len(_normalise(typographic)) == len(typographic))
+
+    # A trivially short quote matches almost anything, so it establishes nothing.
+    check("a too-short quote is refused",
+          locate_quote("the", chunks) is None)
+    check("minimum length is enforced at the boundary",
+          locate_quote("x" * (config.VERIFIED_MIN_QUOTE_CHARS - 1), chunks) is None)
+
+    # Parsing must survive the ways models wrap JSON.
+    check("clean JSON parses",
+          len(_parse_claims('{"claims":[{"claim":"a","quote":"b"}]}')) == 1)
+    check("JSON wrapped in prose parses",
+          len(_parse_claims('Here you go:\n{"claims":[{"claim":"a","quote":"b"}]}\nDone')) == 1)
+    check("a bare list parses", len(_parse_claims('[{"claim":"a","quote":"b"}]')) == 1)
+    check("unparseable output yields no claims", _parse_claims("not json at all") == [])
+    check("empty output yields no claims", _parse_claims("") == [])
+    check("claims without text are dropped",
+          _parse_claims('{"claims":[{"claim":"","quote":"b"},{"claim":"a","quote":"b"}]}') == [
+              {"claim": "a", "quote": "b"}])
+    check("a reasoning block is stripped before parsing",
+          len(_parse_claims('<think>hmm</think>{"claims":[{"claim":"a","quote":"b"}]}')) == 1)
+
+
 def main() -> int:
     print("=" * 74)
     print("docsum pipeline invariants")
@@ -819,6 +918,7 @@ def main() -> int:
         test_chunk_ceiling,
         test_adaptive_top_k,
         test_remote_backend,
+        test_verified_backend,
     ):
         fn()
 

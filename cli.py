@@ -19,6 +19,7 @@ from docsum.datasets import load_mts_dialog, load_multiclinsum, read_document
 from docsum.extractive import summarize_extractive
 from docsum.local import summarize_local
 from docsum.remote import summarize_remote
+from docsum.verified import summarize_verified
 from docsum.report import to_html, to_json, to_text
 from docsum.retrieval import ChunkIndex
 from docsum.validation import format_report, run as run_validation, write_csv
@@ -63,6 +64,15 @@ def cmd_summarize(args: argparse.Namespace) -> int:
             )
         elif args.backend == "groq":
             result = summarize_remote(
+                text,
+                doc_id=doc_id,
+                aspects=args.aspects,
+                top_k=args.top_k,
+                chunk_budget=args.chunk_budget,
+                model=args.groq_model,
+            )
+        elif args.backend == "verified":
+            result = summarize_verified(
                 text,
                 doc_id=doc_id,
                 aspects=args.aspects,
@@ -196,11 +206,12 @@ def main() -> int:
     add_common(p_sum)
     p_sum.add_argument("-n", type=int, default=1, help="how many dataset docs to run")
     p_sum.add_argument("--model", default=config.GEN_MODEL)
-    p_sum.add_argument("--backend", default="api", choices=["api", "extractive", "local", "groq"],
+    p_sum.add_argument("--backend", default="api", choices=["api", "extractive", "local", "groq", "verified"],
                        help="api: Claude with native citations (needs a key). "
                             "extractive: select source sentences verbatim, no key. "
                             "local: generate on a local GPU, ground spans by alignment. "
-                            "groq: same, but generated remotely via Groq.")
+                            "groq: same, but generated remotely via Groq. "
+                            "verified: model cites, we check every quote.")
     p_sum.add_argument("--groq-model", default=config.GROQ_MODEL,
                        help="model for --backend groq")
     p_sum.add_argument("--local-model", default=config.LOCAL_MODEL,

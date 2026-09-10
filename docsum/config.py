@@ -150,5 +150,19 @@ TOP_K_MAX = 32
 # not requests (1000), and one case report costs roughly 2500 tokens round trip
 # -- so a batch run is paced at about three documents per minute. Retrying is
 # the normal path for a batch run, not an error case.
-GROQ_MAX_RETRIES = int(os.environ.get("DOCSUM_GROQ_MAX_RETRIES", "6"))
+GROQ_MAX_RETRIES = int(os.environ.get("DOCSUM_GROQ_MAX_RETRIES", "12"))
 GROQ_MAX_BACKOFF = float(os.environ.get("DOCSUM_GROQ_MAX_BACKOFF", "90"))
+# Never retry a rate limit faster than this, whatever the header claims.
+GROQ_MIN_RATE_LIMIT_WAIT = float(os.environ.get("DOCSUM_GROQ_MIN_WAIT", "8"))
+
+# The verified backend needs a bigger budget than the prose backends: it emits
+# every claim AND a full supporting quote, and gpt-oss spends reasoning tokens
+# from the same allowance. At 2048 the JSON is truncated mid-object and Groq
+# rejects the whole response with an empty failed_generation, which reads like a
+# prompt problem and is not one.
+VERIFIED_MAX_TOKENS = int(os.environ.get("DOCSUM_VERIFIED_MAX_TOKENS", "4096"))
+
+# Shortest quote the verified backend will accept. A two-character "quote"
+# matches somewhere in almost any document, so accepting one would inflate
+# citation_precision with matches that establish nothing.
+VERIFIED_MIN_QUOTE_CHARS = 12

@@ -46,17 +46,27 @@ the whole document, so `search_many()` runs several queries (see
 `ASPECT_PRESETS`) and merges the hits, then returns them in *document order* so
 the summary reads as prose rather than a pile of ranked fragments.
 
-## Four backends
+## Five backends
 
-All four produce the same `SummaryResult`, so `report.py` and `evaluate.py`
-treat them identically and the four stay directly comparable.
+All five produce the same `SummaryResult`, so `report.py` and `evaluate.py`
+treat them identically and the five stay directly comparable.
 
-| | `api` (default) | `extractive` | `local` | `groq` |
+They differ in one thing that matters more than any of the others: **how a
+citation earns the right to be believed.**
+
+| strategy | guarantee | backend |
+|---|---|---|
+| the API extracts the quote itself | the model **cannot** fabricate a citation | `api` |
+| the summary *is* the source | there is nothing to fabricate | `extractive` |
+| the model cites, we check every quote | it **can** fabricate — and we catch it | `verified` |
+| the model is never asked; spans inferred | no assertion to check; similarity only | `local`, `groq` |
+
+| | `api` | `extractive` | `verified` | `local` / `groq` |
 |---|---|---|---|---|
-| Output | generated prose | source sentences, verbatim | generated prose | generated prose |
-| Attribution | Claude's native citations | exact by construction | alignment, after the fact | alignment, after the fact |
-| Can a claim be uncited? | no | no | **yes — and that is the point** | **yes** |
-| `citation_integrity` | measured | 1.0 always | 1.0, but trivially | 1.0, but trivially |
+| Output | prose | source sentences | claims + quotes | prose |
+| Attribution | native citations | by construction | asserted, then verified | alignment |
+| Can a claim be uncited? | no | no | **yes** | **yes** |
+| `citation_integrity` | measured | 1.0 always | 1.0 always | 1.0, but trivially |
 | `numeric_fidelity` | measured | 1.0 always | **measured** | **measured** |
 | Needs | an Anthropic key | nothing | a CUDA GPU | a Groq key |
 | Document leaves the machine | yes | **no** | **no** | yes |
@@ -189,6 +199,57 @@ It remains a screen rather than a verdict. It matches numerals only, so a source
 that spells a number out ("Six months") will not support a summary that writes
 `6`. Check what it flags before treating it as proof. It cannot fire for
 `extractive`, which copies digits verbatim.
+
+**`verified`** exists because the project *asserted* something it had never
+measured: that self-reported citations cannot be trusted. Without an Anthropic
+key the `api` guarantee is unavailable and no other vendor reproduces it — so
+rather than approximate it, this backend tests the premise.
+
+It asks the model for each claim together with a verbatim quote, then locates
+every quote in the text the model was actually shown. A quote that cannot be
+found is not a citation, it is a **caught fabrication**: the claim is emitted
+uncited and the rejection is counted. The resulting `citation_precision`
+(verified ÷ asserted, reported in `SummaryResult.usage`) is a direct measurement
+of how often a model's self-reported citation lies.
+
+Two details keep the verification honest. A quote is only accepted if it appears
+in the **retrieved chunks** — a model cannot legitimately quote text it was never
+sent, and allowing document-wide matching would let a lucky guess pass. And
+matching folds typography and whitespace but nothing else, because models rewrite
+hyphens and spaces constantly (gpt-oss-120b emits U+2011 and U+202F routinely);
+every substitution is one character for one character, so offsets survive and the
+span still slices exactly out of the original.
+
+```bash
+export GROQ_API_KEY=gsk_...
+python cli.py summarize case.txt --backend verified --aspects clinical
+```
+
+**What it measured.** Across 6 MultiClinSum gold documents, `gpt-oss-120b`
+asserted **96 citations and all 96 were real** — `citation_precision` 1.000, zero
+fabrications caught.
+
+That is a small sample and one model, and the honest reading is narrower than it
+first looks. It does **not** vindicate prompt-engineered attribution in general.
+Asking for a *verbatim quote* is a far easier and more self-checkable task than
+asking a model to emit character offsets, which is the pattern this project
+avoids — a quote either appears in the source or it does not, and the model knows
+what it just copied. Nor does the result mean the verification is unnecessary:
+without it there would be no way to know the rate was 100% rather than 80%, and
+an unverified citation is worth nothing regardless of how often it happens to be
+right.
+
+Sample size is limited by the free tier, not by patience. Each verified request
+reserves its full `max_tokens` against an 8000/minute budget, and Groq **queues**
+rather than refusing when you exceed it — requests hang instead of returning 429,
+which looks like a network fault and is not one. Sustained batches need ~25s
+between documents.
+
+It needs a larger token budget than the prose backends — each claim carries a
+full quote, and reasoning tokens come from the same allowance. At 2048 the JSON
+is truncated and Groq rejects the whole response with an empty
+`failed_generation`, which reads like a prompt fault and is not one;
+`VERIFIED_MAX_TOKENS` defaults to 4096.
 
 ### Why not a 14B
 
@@ -436,6 +497,7 @@ ground truth for factuality specifically.
 | `docsum/extractive.py` | key-free backend: selects source sentences verbatim |
 | `docsum/local.py` | local-GPU backend: generates prose, aligns spans after |
 | `docsum/remote.py` | Groq backend: same shape, hosted generation, rate-limit aware |
+| `docsum/verified.py` | model-asserted citations, verified against the source |
 | `docsum/grounding.py` | the alignment shared by the local and Groq backends |
 | `docsum/compare.py` | runs several backends over the same docs and scores them |
 | `docsum/validation.py` | correlates our metrics against 400 human judgements |

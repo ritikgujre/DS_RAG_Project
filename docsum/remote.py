@@ -90,9 +90,64 @@ def _retry_delay(response: httpx.Response, attempt: int) -> float:
     for header in ("retry-after", "x-ratelimit-reset-tokens", "x-ratelimit-reset-requests"):
         delay = _parse_reset(response.headers.get(header))
         if delay is not None:
+            # Floor it. Groq's bucket refills continuously, so once the budget is
+            # exhausted the reset header can report a sub-second value while
+            # there is still nowhere near a full request's worth of tokens
+            # available. Honouring that literally retries immediately, fails
+            # again, and burns the whole retry budget in a few seconds -- which
+            # is exactly how a 20-document run died on its fourth document.
+            delay = max(delay, config.GROQ_MIN_RATE_LIMIT_WAIT)
             # Small jitter so concurrent callers do not resynchronise.
             return min(delay + random.uniform(0.1, 0.5), config.GROQ_MAX_BACKOFF)
     return min(2.0 ** attempt + random.uniform(0, 1), config.GROQ_MAX_BACKOFF)
+
+
+# Last rate-limit state the server reported, so the next request can wait for
+# capacity instead of provoking a 429 and retrying into it.
+_BUDGET: dict[str, float] = {}
+
+
+def _remember_budget(response: httpx.Response) -> None:
+    """Record the token budget the server just reported."""
+    try:
+        limit = float(response.headers["x-ratelimit-limit-tokens"])
+        remaining = float(response.headers["x-ratelimit-remaining-tokens"])
+    except (KeyError, ValueError):
+        return
+    _BUDGET["limit"] = limit
+    _BUDGET["remaining"] = remaining
+    _BUDGET["at"] = time.monotonic()
+
+
+def _pace(needed: int) -> None:
+    """Wait until `needed` tokens are likely available.
+
+    Groq reserves `max_tokens` up front rather than billing actual usage, so a
+    4096-token request claims ~5000 of an 8000/minute bucket. Two back to back
+    exceed the limit by construction -- no retry policy can fix that, because the
+    capacity genuinely is not there yet. The bucket refills continuously at
+    limit/60 tokens per second, so the wait is computable rather than guessed.
+    """
+    limit = _BUDGET.get("limit")
+    remaining = _BUDGET.get("remaining")
+    if not limit or remaining is None:
+        return
+
+    # A request wanting more than the bucket can ever hold is not something
+    # waiting can fix. Cap the target and let it through: the reservation the
+    # server actually takes is usually smaller than this estimate, and if it is
+    # not, the retry path handles the 429. Without this cap the pacer sleeps its
+    # maximum, gets a 429 anyway, and repeats -- 20 minutes on one document.
+    needed = min(needed, int(limit))
+
+    refill_per_second = limit / 60.0
+    elapsed = time.monotonic() - _BUDGET.get("at", 0.0)
+    available = min(limit, remaining + elapsed * refill_per_second)
+    if available >= needed:
+        return
+
+    wait = (needed - available) / refill_per_second
+    time.sleep(min(wait, config.GROQ_MAX_BACKOFF))
 
 
 def _post(payload: dict, timeout: float) -> dict:
@@ -104,8 +159,14 @@ def _post(payload: dict, timeout: float) -> dict:
         "Content-Type": "application/json",
         "User-Agent": "docsum/0.1 (+https://github.com/)",
     }
+    # Reserve-cost estimate: the cap the server holds against the budget, plus
+    # the prompt it has to read.
+    prompt_chars = sum(len(m.get("content") or "") for m in payload.get("messages", []))
+    needed = int(payload.get("max_tokens", 1024)) + prompt_chars // 4
+
     last_error = ""
     for attempt in range(config.GROQ_MAX_RETRIES + 1):
+        _pace(needed)
         try:
             response = httpx.post(
                 f"{config.GROQ_BASE_URL}/chat/completions",
@@ -119,6 +180,8 @@ def _post(payload: dict, timeout: float) -> dict:
                 raise RemoteError(last_error) from exc
             time.sleep(min(2.0 ** attempt, config.GROQ_MAX_BACKOFF))
             continue
+
+        _remember_budget(response)
 
         if response.status_code == 401:
             raise RemoteError("Groq rejected the API key (401).")
