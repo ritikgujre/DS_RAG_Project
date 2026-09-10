@@ -9,6 +9,9 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: docsum
     strategy:
       fail-fast: false
       matrix:
@@ -23,6 +26,7 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
           cache: pip
+          cache-dependency-path: docsum/requirements.txt
 
       - name: Install dependencies
         run: |
@@ -45,6 +49,9 @@ jobs:
 
   lint:
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: docsum
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
