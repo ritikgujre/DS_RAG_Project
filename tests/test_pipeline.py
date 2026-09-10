@@ -454,6 +454,78 @@ def test_local_alignment() -> None:
     check("no invalid citations", invalid == 0)
 
 
+# --- 12. Metric validation against human judgement ---------------------------
+
+def test_metric_validation() -> None:
+    """The correlation study is the only non-circular check we have.
+
+    Every other number in this project is a metric grading itself. These tests
+    guard the plumbing that connects our metrics to the 400 human scores --
+    especially the positional alignment, which has no join key and would fail
+    silently if either file changed length.
+    """
+    print()
+    print("metric validation")
+
+    from docsum import validation as V
+
+    check("correlation study files are present",
+          V.SUMMARIES_CSV.exists() and V.SCORES_CSV.exists())
+
+    pairs = V._read_pairs()
+    check("400 summaries pair with 400 human scores", len(pairs) == 400,
+          f"got {len(pairs)}")
+    check("summary rows carry dialogue, reference and automatic summary",
+          all(k in pairs[0][0] for k in ("Dialogue", "Reference Summary", "Automatic Summary")))
+    check("score rows carry the human labels",
+          all(k in pairs[0][1] for k in ("FactualF1", "HallucinationRate", "OmissionRate")))
+
+    # The BOM on both files would corrupt the first column name if it were read
+    # as plain utf-8, making every lookup miss.
+    check("BOM handled (first column name is clean)",
+          "ID" in pairs[0][0] and "FactualPrecision" in pairs[0][1])
+
+    # grounding_coverage must behave sensibly at both extremes, or the
+    # correlations computed from it mean nothing.
+    source = ("Doctor: When did the pain begin? Patient: About eight years ago. "
+              "Doctor: Any surgery? Patient: I had a discectomy in 2011.")
+    copied = "The patient has had pain for about eight years. She had a discectomy in 2011."
+    unrelated = ("The spacecraft completed its orbital insertion burn. "
+                 "Telemetry was transmitted to the ground station.")
+
+    cov_copied, sup_copied = V.grounding_coverage(copied, source)
+    cov_unrel, _ = V.grounding_coverage(unrelated, source)
+    check("grounding_coverage is high for a faithful summary", cov_copied >= 0.5,
+          f"got {cov_copied}")
+    check("grounding_coverage is low for an unrelated summary", cov_unrel == 0.0,
+          f"got {cov_unrel}")
+    check("faithful summary carries real support", sup_copied > 0.4, f"got {sup_copied}")
+    check("grounding_coverage separates the two cases", cov_copied > cov_unrel)
+
+    # Empty inputs must not raise -- validation runs unattended over 400 rows.
+    empty_cov, empty_sup = V.grounding_coverage("", source)
+    check("empty summary yields zero coverage, no exception",
+          empty_cov == 0.0 and empty_sup == 0.0)
+
+    rows = V.run(limit=6)
+    check("run(limit) returns that many rows", len(rows) == 6, f"got {len(rows)}")
+    check("every metric field is populated",
+          all(isinstance(getattr(rows[0], k), float) for k in V.AUTOMATIC + V.HUMAN))
+
+    disc = V.label_discrimination(rows)
+    check("label_discrimination reports every human label",
+          set(disc) == set(V.HUMAN))
+    check("discrimination entries carry a zero_fraction",
+          "zero_fraction" in disc["HallucinationRate"])
+
+    blocks = V.by_system(rows[:3])
+    check("by_system groups into blocks", blocks[0]["n"] == 3)
+
+    report = V.format_report(rows)
+    check("format_report mentions the correlation and the labels",
+          "Spearman" in report and "HallucinationRate" in report)
+
+
 def main() -> int:
     print("=" * 74)
     print("docsum pipeline invariants")
@@ -470,6 +542,7 @@ def main() -> int:
         test_loaders,
         test_extractive_backend,
         test_local_alignment,
+        test_metric_validation,
     ):
         fn()
 

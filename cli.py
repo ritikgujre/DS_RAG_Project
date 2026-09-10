@@ -20,6 +20,7 @@ from docsum.extractive import summarize_extractive
 from docsum.local import summarize_local
 from docsum.report import to_html, to_json, to_text
 from docsum.retrieval import ChunkIndex
+from docsum.validation import format_report, run as run_validation, write_csv
 from docsum.summarizer import ASPECT_PRESETS, summarize
 
 
@@ -153,6 +154,21 @@ def cmd_compare(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_validate(args: argparse.Namespace) -> int:
+    """Check our metrics against the 400 human-scored MTS-Dialog summaries."""
+    def progress(i, n):
+        print(f"  scored {i}/{n}", file=sys.stderr)
+
+    rows = run_validation(limit=args.limit, progress=progress)
+    print()
+    print(format_report(rows))
+    if args.out:
+        write_csv(rows, args.out)
+        print()
+        print(f"per-summary rows written to {args.out}")
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -190,6 +206,12 @@ def main() -> int:
                        help="comma-separated: extractive, local, api")
     p_cmp.add_argument("--quiet", action="store_true", help="table only, no per-document lines")
     p_cmp.set_defaults(func=cmd_compare)
+
+    p_val = sub.add_parser("validate",
+                           help="correlate our metrics against human judgement")
+    p_val.add_argument("--limit", type=int, default=None, help="score only the first N summaries")
+    p_val.add_argument("--out", help="write per-summary rows to this CSV")
+    p_val.set_defaults(func=cmd_validate)
 
     p_ins = sub.add_parser("inspect", help="chunk and retrieve only, no API call")
     add_common(p_ins)

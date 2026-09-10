@@ -95,10 +95,13 @@ is **left uncited** and shows up in `result.unattributed_claims`.
 
 Read the metrics accordingly. `citation_integrity` is 1.0 here trivially — the
 spans are real slices, so of course they resolve. The signals that carry
-information are `attribution_coverage` (how much of the summary could be tied to
-the source at all) and `numeric_fidelity` (whether generated numbers actually
-occur in the document). Both can fail on this backend, and a failure is a
-finding about the model rather than a bug.
+information are `attribution_coverage` and `numeric_fidelity`; both can fail on
+this backend, and a failure is a finding about the model rather than a bug.
+
+They measure **traceability, not factuality** — see "Are the metrics
+trustworthy?" below, where this alignment mechanism is checked against 400 human
+judgements. It moves the right way against hallucination but weakly, and it does
+not reproduce the humans' ranking of systems.
 
 Defaults to `unsloth/Qwen3-8B-bnb-4bit` — ~6 GB of VRAM, loads in about 8s.
 Override with `DOCSUM_LOCAL_MODEL`, and see the `LOCAL_*` knobs in
@@ -265,6 +268,71 @@ mapping is wrong and the attribution feature is silently lying.
 `numeric_fidelity` exists because ROUGE cannot tell a paraphrase from a
 hallucinated dosage, and on clinical text that distinction is the whole point.
 
+## Are the metrics trustworthy?
+
+Every other number here is an automatic metric grading itself, which is circular.
+MTS-Dialog ships the one escape: 400 machine summaries with their source
+dialogues, aligned to 400 human fact-based scores. `cli.py validate` scores those
+400 with our metrics and correlates the result.
+
+```bash
+python cli.py validate --out validation.csv
+```
+
+Spearman rho against the human labels, n=400 (`*` = p < 0.01):
+
+| | FactualF1 | Hallucination | Omission |
+|---|---|---|---|
+| `grounding_coverage` | 0.117 | **−0.168*** | −0.137* |
+| `numeric_fidelity` | 0.283* | −0.085 | −0.206* |
+| ROUGE-1 | 0.361* | −0.020 | **−0.467*** |
+| ROUGE-L | 0.367* | −0.030 | −0.459* |
+
+Read this before quoting any metric in this repository:
+
+**The corpus cannot strongly validate hallucination detection.** `HallucinationRate`
+is exactly zero for **92%** of the 400 summaries (mean 0.023, sd 0.090). With that
+floor effect, *any* metric would correlate weakly, so a weak number here is a fact
+about the data, not a verdict on the metric. Restricted to the 33 summaries that
+do contain hallucination, `grounding_coverage` reaches rho = −0.367 (p = 0.036).
+
+**`grounding_coverage` moves the right way, weakly.** This is the local backend's
+alignment step used as a measurement, so it is the closest thing to a test of that
+backend's attribution: the sign is correct against both hallucination and omission
+and both are significant, but the magnitudes are small.
+
+**`numeric_fidelity` does not track human-judged hallucination** (−0.085, not
+significant; and it inverts on the hallucinating subset). This does not make it
+useless — it caught a genuinely fabricated platelet count in the MultiClinSum
+run — but it is a *narrow, precise* instrument for invented numerals, not a
+general factuality score, and must not be presented as one.
+
+**ROUGE is the strongest correlate of human factual judgement on this data**, and
+the only signal here that recovers the humans' ranking of the four systems:
+
+| block | FactualF1 (human) | grounding_coverage | numeric_fidelity | ROUGE-1 |
+|---|---|---|---|---|
+| 0 | 0.614 | 0.583 | 0.730 | 0.295 |
+| 1 | 0.714 | 0.705 | 0.590 | 0.384 |
+| 2 | 0.709 | 0.622 | 0.630 | 0.401 |
+| 3 | **0.728** | 0.515 | 0.670 | **0.409** |
+
+ROUGE orders the systems 3 > 2 > 1 > 0 against the humans' 3 > 1 > 2 > 0 (blocks 1
+and 2 differ by 0.005, i.e. noise). Both attribution metrics get it wrong:
+`grounding_coverage` ranks block 3 *last* where humans rank it first, and
+`numeric_fidelity` ranks block 0 *first* where humans rank it last.
+
+**What this means for the project's claims.** Attribution and factuality are not
+the same property, and this run is the evidence. A summary can be perfectly
+traceable and still omit most of the source, or be fluent and faithful while
+citing nothing. The attribution metrics answer "can a reader check this claim
+against the source?" — which is what this project is for — and should be reported
+as traceability, not as a factuality score. Where factuality is the claim, ROUGE
+against a reference remains the better-supported signal on this data.
+
+One data defect worth knowing: `OmissionRate` includes negative values (min
+−1.0), so it is not a clean rate. Treat it as an ordinal signal.
+
 ## Datasets
 
 Both corpora in the parent directory load through `docsum/datasets.py`:
@@ -290,7 +358,8 @@ ground truth for factuality specifically.
 | `docsum/extractive.py` | key-free backend: selects source sentences verbatim |
 | `docsum/local.py` | local-GPU backend: generates prose, aligns spans after |
 | `docsum/compare.py` | runs several backends over the same docs and scores them |
+| `docsum/validation.py` | correlates our metrics against 400 human judgements |
 | `docsum/report.py` | text / JSON / interactive HTML output |
 | `docsum/evaluate.py` | ROUGE + attribution + numeric fidelity |
 | `docsum/datasets.py` | corpus loaders and document text extraction |
-| `cli.py` | `summarize`, `compare` and `inspect` commands |
+| `cli.py` | `summarize`, `compare`, `validate` and `inspect` commands |
