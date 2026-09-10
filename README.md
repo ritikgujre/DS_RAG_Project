@@ -146,14 +146,41 @@ half the peak and loads in 8 seconds. A larger pagefile may make 14B viable.
 
 ## Setup
 
+Python 3.10+ (developed on 3.14).
+
 ```bash
 python -m venv .venv && ./.venv/Scripts/python.exe -m pip install -r requirements.txt
 ```
 
+> **On Windows, check `python` is real first.** A bare `python` is often a
+> Microsoft Store stub that prints an install message and exits, which makes the
+> line above fail confusingly. Verify with `python --version`; if it is a stub,
+> use the full interpreter path, e.g.
+> `C:\Users\<you>\AppData\Local\Programs\Python\Python314\python.exe -m venv .venv`.
+
+Verify the install — this needs no API key and no GPU:
+
+```bash
+PYTHONPATH=. ./.venv/Scripts/python.exe tests/test_pipeline.py
+```
+
 Embeddings run locally on CPU, so retrieval needs no API key and no document
-text leaves the machine for that half of the pipeline. The `extractive`
-backend needs nothing further; `local` additionally needs a CUDA GPU and a
-CUDA build of torch. Only the `api` backend needs a key:
+text leaves the machine for that half of the pipeline. The `extractive` backend
+needs nothing further.
+
+**For `--backend local`** you also need a CUDA GPU and a CUDA build of torch.
+The plain PyPI wheel is CPU-only and will silently leave the GPU idle, so install
+it from the index matching your CUDA version:
+
+```bash
+./.venv/Scripts/python.exe -m pip install --index-url https://download.pytorch.org/whl/cu130 torch==2.13.0+cu130
+```
+
+Confirm with `torch.cuda.is_available()`. The model downloads on first use
+(~6 GB). If that fails with a spurious `not enough space on the disk` error, set
+`HF_HUB_DISABLE_XET=1` to fall back to plain HTTP transfer.
+
+**For `--backend api`** you need a key:
 
 ```bash
 export ANTHROPIC_API_KEY=sk-...
