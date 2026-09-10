@@ -159,6 +159,18 @@ def _numeric_forms(token: str) -> set[str]:
     return forms
 
 
+# Typographic separators models use inside numbers: narrow no-break space,
+# no-break space, thin space, figure space. gpt-oss-120b writes "25 000" with
+# U+202F, which without normalisation tokenises as "25" and "000" -- two
+# fabricated numbers where the model in fact copied the value faithfully.
+_DIGIT_SEPARATORS = re.compile(r"(?<=\d)[    ](?=\d)")
+
+
+def _normalise_numerals(text: str) -> str:
+    """Collapse typographic thousands separators so numerals tokenise correctly."""
+    return _DIGIT_SEPARATORS.sub("", text)
+
+
 def numeric_fidelity(summary: str, source_text: str) -> tuple[float, list[str]]:
     """Share of numbers in the summary that also occur in the source.
 
@@ -170,16 +182,28 @@ def numeric_fidelity(summary: str, source_text: str) -> tuple[float, list[str]]:
     source is not miscounted as invention. See `_numeric_forms` for exactly what
     is and is not decomposed.
 
-    Still a screen rather than a verdict: it matches numerals only, so a source
-    that spells a number out ("Six months") does not support a summary that
-    writes it as a digit.
+    Still a screen rather than a verdict, with two known false positives:
+
+    * It matches numerals only, so a source spelling a number out ("Six months")
+      does not support a summary that writes it as a digit.
+    * List enumerators count as numbers. A summary that writes "(1) ... (2) ..."
+      is flagged for indices that are structure, not claims. Models that format
+      with numbered lists therefore score worse than models writing plain prose,
+      independently of how faithful either is.
+    * Source corruption inverts the test. multiclinsum_gs_en_20 lost its
+      subscripts during text extraction, so the document reads "pCO23.4 kPa,
+      pO211.7 kPa, HCO319.5 mmol/L" and "SO294%". A model that correctly reads
+      those as pCO2 3.4, pO2 11.7, HCO3 19.5 and SO2 94% is then flagged for
+      four inventions -- penalised precisely for getting it right.
+
+    Typographic thousands separators are handled (see `_normalise_numerals`).
     """
-    summary_numbers = _NUMERIC.findall(summary)
+    summary_numbers = _NUMERIC.findall(_normalise_numerals(summary))
     if not summary_numbers:
         return 1.0, []
 
     supported: set[str] = set()
-    for token in _NUMERIC.findall(source_text):
+    for token in _NUMERIC.findall(_normalise_numerals(source_text)):
         supported |= _numeric_forms(token)
 
     missing = [n for n in summary_numbers if not (_numeric_forms(n) & supported)]

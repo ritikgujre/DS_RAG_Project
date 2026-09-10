@@ -27,6 +27,9 @@ Models that instead inline it in `<think>` tags are handled by
 from __future__ import annotations
 
 import os
+import random
+import re
+import time
 
 import httpx
 
@@ -56,6 +59,42 @@ def _api_key() -> str:
     return key
 
 
+# Groq expresses reset times as "630ms", "1m26.4s", "2.5s" rather than seconds.
+_DURATION = re.compile(r"(?:(\d+(?:\.\d+)?)m)?(?:(\d+(?:\.\d+)?)s)?(?:(\d+(?:\.\d+)?)ms)?$")
+
+
+def _parse_reset(value: str | None) -> float | None:
+    """Seconds until a rate-limit window resets, from Groq's duration format."""
+    if not value:
+        return None
+    value = value.strip()
+    try:  # `retry-after` is plain seconds when present
+        return float(value)
+    except ValueError:
+        pass
+    m = _DURATION.match(value)
+    if not m or not any(m.groups()):
+        return None
+    minutes, seconds, millis = (float(g) if g else 0.0 for g in m.groups())
+    return minutes * 60 + seconds + millis / 1000
+
+
+def _retry_delay(response: httpx.Response, attempt: int) -> float:
+    """How long to wait before retrying a rate-limited request.
+
+    Prefers what the server says over guessing. The token window is the binding
+    one in practice: the free tier allows 1000 requests/minute but only 8000
+    tokens/minute, and one case report costs roughly 2500 tokens round trip --
+    so a batch run is paced by tokens, roughly three documents per minute.
+    """
+    for header in ("retry-after", "x-ratelimit-reset-tokens", "x-ratelimit-reset-requests"):
+        delay = _parse_reset(response.headers.get(header))
+        if delay is not None:
+            # Small jitter so concurrent callers do not resynchronise.
+            return min(delay + random.uniform(0.1, 0.5), config.GROQ_MAX_BACKOFF)
+    return min(2.0 ** attempt + random.uniform(0, 1), config.GROQ_MAX_BACKOFF)
+
+
 def _post(payload: dict, timeout: float) -> dict:
     # Groq sits behind Cloudflare, which rejects requests carrying no
     # recognisable User-Agent with a 403 (error 1010) that reads like an auth
@@ -65,22 +104,43 @@ def _post(payload: dict, timeout: float) -> dict:
         "Content-Type": "application/json",
         "User-Agent": "docsum/0.1 (+https://github.com/)",
     }
-    try:
-        response = httpx.post(
-            f"{config.GROQ_BASE_URL}/chat/completions",
-            headers=headers, json=payload, timeout=timeout,
-        )
-    except httpx.HTTPError as exc:
-        raise RemoteError(f"could not reach Groq: {exc}") from exc
+    last_error = ""
+    for attempt in range(config.GROQ_MAX_RETRIES + 1):
+        try:
+            response = httpx.post(
+                f"{config.GROQ_BASE_URL}/chat/completions",
+                headers=headers, json=payload, timeout=timeout,
+            )
+        except httpx.HTTPError as exc:
+            # Transient network trouble is worth one more attempt; a dead host
+            # is not worth many.
+            last_error = f"could not reach Groq: {exc}"
+            if attempt >= config.GROQ_MAX_RETRIES:
+                raise RemoteError(last_error) from exc
+            time.sleep(min(2.0 ** attempt, config.GROQ_MAX_BACKOFF))
+            continue
 
-    if response.status_code == 401:
-        raise RemoteError("Groq rejected the API key (401).")
-    if response.status_code == 429:
-        raise RemoteError("Groq rate limit hit (429). Retry, or lower the batch size.")
-    if response.status_code >= 400:
-        raise RemoteError(f"Groq returned {response.status_code}: {response.text[:300]}")
+        if response.status_code == 401:
+            raise RemoteError("Groq rejected the API key (401).")
 
-    return response.json()
+        # Rate limits are the normal case for a batch run on the free tier, not
+        # an error: wait out the window the server names rather than failing the
+        # document. Without this a 20-document evaluation dies after two.
+        if response.status_code == 429 or response.status_code >= 500:
+            last_error = f"Groq returned {response.status_code}"
+            if attempt >= config.GROQ_MAX_RETRIES:
+                raise RemoteError(
+                    f"{last_error} after {attempt + 1} attempts: {response.text[:200]}"
+                )
+            time.sleep(_retry_delay(response, attempt))
+            continue
+
+        if response.status_code >= 400:
+            raise RemoteError(f"Groq returned {response.status_code}: {response.text[:300]}")
+
+        return response.json()
+
+    raise RemoteError(last_error or "Groq request failed")
 
 
 def available_models(timeout: float = 30.0) -> list[str]:

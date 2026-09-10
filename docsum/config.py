@@ -145,3 +145,10 @@ CHUNK_MAX_CHARS = 2400
 # Ceiling for the adaptive top_k in search_many. Bounded so a pathological
 # document cannot push every chunk into the prompt.
 TOP_K_MAX = 32
+
+# Rate limiting. The free tier's binding constraint is tokens per minute (8000),
+# not requests (1000), and one case report costs roughly 2500 tokens round trip
+# -- so a batch run is paced at about three documents per minute. Retrying is
+# the normal path for a batch run, not an error case.
+GROQ_MAX_RETRIES = int(os.environ.get("DOCSUM_GROQ_MAX_RETRIES", "6"))
+GROQ_MAX_BACKOFF = float(os.environ.get("DOCSUM_GROQ_MAX_BACKOFF", "90"))

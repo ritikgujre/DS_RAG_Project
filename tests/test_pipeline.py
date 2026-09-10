@@ -300,6 +300,26 @@ def test_metrics() -> None:
     check("numeric: a genuinely invented value is still flagged", s == 0.0,
           f"got {s}, missing {missing}")
 
+    # -- typographic separators ----------------------------------------------
+    # gpt-oss-120b writes thousands with U+202F (narrow no-break space), so
+    # "25 000" tokenised as "25" and "000" -- two fabrications reported for a
+    # value the model had copied faithfully. It cost the Groq backend most of
+    # its apparent numeric_fidelity gap against the local model.
+    src = "Platelet count was 25,000 per uL and the dose was 50000 units."
+    s, missing = numeric_fidelity("Platelets were 25 000 per uL with 50 000 units.", src)
+    check("numeric: narrow no-break space thousands separator is handled", s == 1.0,
+          f"got {s}, missing {missing}")
+    s, _ = numeric_fidelity("Platelets were 25 000 per uL.", src)
+    check("numeric: non-breaking space separator is handled", s == 1.0, f"got {s}")
+    s, _ = numeric_fidelity("Platelets were 25 000 per uL.", src)
+    check("numeric: thin space separator is handled", s == 1.0, f"got {s}")
+    s, missing = numeric_fidelity("Platelets were 99 999 per uL.", src)
+    check("numeric: normalisation does not mask a real invention", s == 0.0,
+          f"got {s}, missing {missing}")
+    # A space that is not between digits must not be swallowed.
+    s, _ = numeric_fidelity("Dose 50000 units.", "Dose 50000 units given.")
+    check("numeric: ordinary text unaffected by normalisation", s == 1.0)
+
     # The real hallucination found on multiclinsum_gs_en_8 must stay caught.
     if not CORPORA:
         SKIP.append("test_metrics::gs_en_8 regression")
@@ -657,6 +677,128 @@ def test_adaptive_top_k() -> None:
     check("effective_top_k is capped", huge.effective_top_k(config.TOP_K, 8) == config.TOP_K_MAX)
 
 
+# --- 14. Groq backend: rate limits and failure handling ---------------------
+
+def test_remote_backend() -> None:
+    """The Groq backend, exercised without a network or a key.
+
+    Rate limiting is the interesting part. The free tier allows 1000
+    requests/minute but only 8000 tokens/minute, and one case report costs
+    roughly 2500 tokens round trip -- so a batch run is paced by tokens at about
+    three documents per minute, and 429 is the normal path rather than an error.
+    A 20-document comparison died after two before backoff was added.
+    """
+    print()
+    print("groq backend")
+
+    import os
+    import httpx
+    from docsum import config
+    from docsum.remote import (
+        RemoteError, _parse_reset, _retry_delay, _post, summarize_remote,
+    )
+
+    # Groq reports reset windows in its own duration format, not seconds.
+    for raw, expected in [("630ms", 0.63), ("2.5s", 2.5), ("1m", 60.0), ("1m26.4s", 86.4)]:
+        got = _parse_reset(raw)
+        check(f"parse reset {raw!r} -> {expected}", got is not None and abs(got - expected) < 1e-6,
+              f"got {got}")
+    check("plain seconds parse", _parse_reset("12") == 12.0)
+    check("unparseable reset returns None", _parse_reset("nonsense") is None)
+    check("missing reset returns None", _parse_reset(None) is None)
+
+    # The server's stated wait is preferred over guessing, and always capped.
+    resp = httpx.Response(429, headers={"x-ratelimit-reset-tokens": "2s"})
+    delay = _retry_delay(resp, attempt=0)
+    check("retry delay follows the server's reset header", 2.0 <= delay <= 2.6,
+          f"got {delay}")
+    capped = _retry_delay(httpx.Response(429, headers={"retry-after": "99999"}), 0)
+    check("retry delay is capped", capped <= config.GROQ_MAX_BACKOFF, f"got {capped}")
+    blind = _retry_delay(httpx.Response(500), attempt=3)
+    check("falls back to exponential backoff with no headers", 8.0 <= blind <= 9.1,
+          f"got {blind}")
+
+    # A missing key must explain itself and name the backends that need nothing.
+    saved = os.environ.pop(config.GROQ_API_KEY_ENV, None)
+    try:
+        try:
+            summarize_remote("Some text. More text.", doc_id="t")
+            check("missing key raises RemoteError", False, "no exception")
+        except RemoteError as exc:
+            msg = str(exc)
+            check("missing key raises RemoteError", True)
+            check("the error names the env var", config.GROQ_API_KEY_ENV in msg)
+            check("the error points at a backend needing no credentials",
+                  "extractive" in msg)
+    finally:
+        if saved is not None:
+            os.environ[config.GROQ_API_KEY_ENV] = saved
+
+    # An empty document short-circuits before any network call, key or not.
+    saved = os.environ.get(config.GROQ_API_KEY_ENV)
+    os.environ[config.GROQ_API_KEY_ENV] = "not-a-real-key"
+    try:
+        empty = summarize_remote("", doc_id="empty")
+        check("empty document returns an empty result without calling out",
+              empty.summary == "" and not empty.facts)
+    finally:
+        if saved is None:
+            os.environ.pop(config.GROQ_API_KEY_ENV, None)
+        else:
+            os.environ[config.GROQ_API_KEY_ENV] = saved
+
+    # Retry must eventually give up rather than hang forever.
+    calls = {"n": 0}
+
+    def always_429(*a, **kw):
+        calls["n"] += 1
+        return httpx.Response(429, headers={"x-ratelimit-reset-tokens": "1ms"},
+                              text="rate limited", request=httpx.Request("POST", "http://x"))
+
+    real_post, real_key = httpx.post, os.environ.get(config.GROQ_API_KEY_ENV)
+    os.environ[config.GROQ_API_KEY_ENV] = "not-a-real-key"
+    httpx.post = always_429
+    try:
+        try:
+            _post({"model": "x", "messages": []}, timeout=5)
+            check("persistent 429 eventually raises", False, "no exception")
+        except RemoteError as exc:
+            check("persistent 429 eventually raises", True)
+            check("gives up after GROQ_MAX_RETRIES + 1 attempts",
+                  calls["n"] == config.GROQ_MAX_RETRIES + 1,
+                  f"made {calls['n']} attempts")
+            check("the error says it retried", "attempts" in str(exc))
+    finally:
+        httpx.post = real_post
+        if real_key is None:
+            os.environ.pop(config.GROQ_API_KEY_ENV, None)
+        else:
+            os.environ[config.GROQ_API_KEY_ENV] = real_key
+
+    # A bad key must fail fast, not burn the whole retry budget.
+    calls["n"] = 0
+
+    def always_401(*a, **kw):
+        calls["n"] += 1
+        return httpx.Response(401, text="unauthorized", request=httpx.Request("POST", "http://x"))
+
+    os.environ[config.GROQ_API_KEY_ENV] = "not-a-real-key"
+    httpx.post = always_401
+    try:
+        try:
+            _post({"model": "x", "messages": []}, timeout=5)
+            check("401 raises", False, "no exception")
+        except RemoteError:
+            check("401 raises", True)
+            check("401 is not retried", calls["n"] == 1, f"made {calls['n']} attempts")
+    finally:
+        httpx.post = real_post
+        if real_key is None:
+            os.environ.pop(config.GROQ_API_KEY_ENV, None)
+        else:
+            os.environ[config.GROQ_API_KEY_ENV] = real_key
+
+
 def main() -> int:
     print("=" * 74)
     print("docsum pipeline invariants")
@@ -676,6 +818,7 @@ def main() -> int:
         test_metric_validation,
         test_chunk_ceiling,
         test_adaptive_top_k,
+        test_remote_backend,
     ):
         fn()
 

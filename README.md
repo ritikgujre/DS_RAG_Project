@@ -46,20 +46,21 @@ the whole document, so `search_many()` runs several queries (see
 `ASPECT_PRESETS`) and merges the hits, then returns them in *document order* so
 the summary reads as prose rather than a pile of ranked fragments.
 
-## Three backends
+## Four backends
 
-All three produce the same `SummaryResult`, so `report.py` and `evaluate.py`
-treat them identically and the three stay directly comparable.
+All four produce the same `SummaryResult`, so `report.py` and `evaluate.py`
+treat them identically and the four stay directly comparable.
 
-| | `api` (default) | `extractive` | `local` |
-|---|---|---|---|
-| Output | generated prose | source sentences, verbatim | generated prose |
-| Attribution | Claude's native citations | exact by construction | alignment, after the fact |
-| Can a claim be uncited? | no | no | **yes — and that is the point** |
-| `citation_integrity` | measured | 1.0 always | 1.0, but trivially |
-| `numeric_fidelity` | measured | 1.0 always | **measured** |
-| Needs | an API key | nothing | a CUDA GPU |
-| Speed | one API round trip | ~0.5s/doc | seconds/doc after model load |
+| | `api` (default) | `extractive` | `local` | `groq` |
+|---|---|---|---|---|
+| Output | generated prose | source sentences, verbatim | generated prose | generated prose |
+| Attribution | Claude's native citations | exact by construction | alignment, after the fact | alignment, after the fact |
+| Can a claim be uncited? | no | no | **yes — and that is the point** | **yes** |
+| `citation_integrity` | measured | 1.0 always | 1.0, but trivially | 1.0, but trivially |
+| `numeric_fidelity` | measured | 1.0 always | **measured** | **measured** |
+| Needs | an Anthropic key | nothing | a CUDA GPU | a Groq key |
+| Document leaves the machine | yes | **no** | **no** | yes |
+| Speed | one API round trip | ~0.2s/doc | ~27s/doc after model load | ~1s/doc, rate limited |
 
 **`extractive`** selects sentences instead of writing them, so the summary is
 made *of* the document: `source_text[span.start:span.end]` is literally the
@@ -71,15 +72,30 @@ the MTS-Dialog correlation study puts omission at 31–54% against hallucination
 below 4%, so coverage is the failure worth designing against.
 
 The trade is prose quality — it reads as a highlight reel. Measured on the
-**full 592-document MultiClinSum English gold set** (121s, 0.20s/doc): ROUGE-1
-0.328 (sd 0.091, median 0.318, range 0.050–0.755), ROUGE-L 0.207, 6.4 claims per
-summary.
+**entire MultiClinSum gold set, all four languages, 2,368 documents**:
 
-The result that matters is the other column: **attribution coverage, citation
-integrity and numeric fidelity were exactly 1.0 on all 592 documents, with zero
+| lang | docs | s/doc | ROUGE-1 | ROUGE-L | claims | attrib / integrity / numeric |
+|---|---|---|---|---|---|---|
+| en | 592 | 0.21 | 0.328 | 0.207 | 6.4 | 1.0 / 1.0 / 1.0 |
+| es | 592 | 0.25 | 0.382 | 0.229 | 6.4 | 1.0 / 1.0 / 1.0 |
+| fr | 592 | 0.26 | 0.390 | 0.221 | 6.4 | 1.0 / 1.0 / 1.0 |
+| pt | 592 | 0.27 | 0.363 | 0.221 | 6.4 | 1.0 / 1.0 / 1.0 |
+
+The result that matters is the last column: **attribution coverage, citation
+integrity and numeric fidelity were exactly 1.0 on all 2,368 documents, with zero
 invalid citations.** These are by-construction properties, so anything less would
 mean the offset arithmetic had broken somewhere in the corpus — this is the run
-that shows it does not.
+that shows it does not, in four languages.
+
+English ROUGE is the *lowest* of the four, which is worth reading carefully
+rather than as a cross-lingual win: MultiClinSum's fr and pt splits read as
+machine translations of English source material, and translated prose is more
+formulaic, so verbatim sentence selection lines up with the reference more
+easily. Treat the es/fr/pt figures as a property of the corpus, not evidence
+that the method transfers better to those languages.
+
+The English spread is wide — sd 0.091, median 0.318, range 0.050–0.755 — so
+quote the distribution, not the mean alone.
 
 ```bash
 python cli.py summarize case.txt --backend extractive --aspects clinical
@@ -111,16 +127,27 @@ Override with `DOCSUM_LOCAL_MODEL`, and see the `LOCAL_*` knobs in
 python cli.py summarize case.txt --backend local --aspects clinical
 ```
 
-Measured head-to-head on the same 12 MultiClinSum English gold documents
-(`cli.py compare`), which is the honest way to read this backend:
+Measured head-to-head on the same 20 MultiClinSum English gold documents
+(`cli.py compare`), which is the honest way to read the generative backends:
 
-| | extractive | local (Qwen3-8B) |
-|---|---|---|
-| attribution_coverage | 1.0 | 0.988 |
-| numeric_fidelity | 1.0 | 0.992 |
-| ROUGE-1 / ROUGE-L | 0.348 / 0.212 | 0.331 / 0.209 |
-| claims per summary | 5.0 | 14.9 |
-| seconds per document | 0.25 | 34.8 |
+| | extractive | local (Qwen3-8B) | groq (gpt-oss-120b) |
+|---|---|---|---|
+| attribution_coverage | **1.0** | 0.993 | 0.987 |
+| numeric_fidelity | **1.0** | 0.988 | 0.982 |
+| citation_integrity | 1.0 | 1.0 | 1.0 |
+| ROUGE-1 / ROUGE-L | **0.341** / **0.221** | 0.311 / 0.209 | 0.276 / 0.185 |
+| claims per summary | 5.6 | 16.0 | 16.6 |
+| seconds per document | **0.15** | 26.9 | 16.4 |
+
+The 120B model scoring *below* the 8B is the result most likely to be
+misread, so it is worth stating what it does and does not mean. Its lower ROUGE
+is real: it writes at greater length and in its own register, which diverges
+from the reference. Its lower `numeric_fidelity` is mostly **not** real, and
+chasing that down produced three separate confounds worth knowing about — see
+the caveats under "Are the metrics trustworthy?". Across all 20 documents
+exactly **one** genuine fabrication survives scrutiny: an invented platelet
+count of 230,000 on `gs_en_8`, produced independently by *both* generative
+models, and flagged as uncited by the alignment layer in both cases.
 
 The local backend writes markedly more detailed, readable prose — roughly three
 times the claims — and it is the only backend here whose attribution can fail,
@@ -129,6 +156,27 @@ is flagged: a fabricated platelet count (`230,000/mm3`, absent from the source).
 The alignment layer independently flagged that same sentence as uncited, so the
 two signals agree on the one document that is actually wrong. ROUGE is a wash,
 and extractive is ~100x faster.
+
+**`groq`** is architecturally the same backend with a different generator:
+generate freely, then recover spans with the identical alignment. **Groq has no
+citations feature**, so it does *not* close the `api` gap — only Claude's
+citations can, because only there does the API extract `cited_text` itself.
+
+What it buys is size and speed. `openai/gpt-oss-120b` is roughly an order of
+magnitude larger than the 8B that fits in 16 GB of VRAM, and returns in about a
+second. What it costs is that the document leaves the machine — `extractive` and
+`local` never send anything anywhere.
+
+Rate limits are the practical constraint, and they are tighter than they look:
+the free tier allows 1000 requests/minute but only **8000 tokens/minute**, and
+one case report costs ~2500 tokens round trip. That paces a batch run at roughly
+three documents per minute, so 429 is the normal path and the backend waits out
+the window the server names rather than failing the document.
+
+```bash
+export GROQ_API_KEY=gsk_...
+python cli.py summarize case.txt --backend groq --aspects clinical
+```
 
 **On `numeric_fidelity`:** it compares numeric tokens, breaking composites on
 `/` at both ends, so a date reformatted from `31/05/2023` into "May 31, 2023" —
@@ -189,7 +237,14 @@ Confirm with `torch.cuda.is_available()`. The model downloads on first use
 (~6 GB). If that fails with a spurious `not enough space on the disk` error, set
 `HF_HUB_DISABLE_XET=1` to fall back to plain HTTP transfer.
 
-**For `--backend api`** you need a key:
+**For `--backend groq`** you need a Groq key (free tier works; it is rate
+limited to 8000 tokens/minute, about three documents per minute):
+
+```bash
+export GROQ_API_KEY=gsk_...
+```
+
+**For `--backend api`** you need an Anthropic key:
 
 ```bash
 export ANTHROPIC_API_KEY=sk-...
@@ -330,6 +385,29 @@ against the source?" — which is what this project is for — and should be rep
 as traceability, not as a factuality score. Where factuality is the claim, ROUGE
 against a reference remains the better-supported signal on this data.
 
+### Three ways `numeric_fidelity` lies to you
+
+Found while investigating why a 120B model appeared to hallucinate more than an
+8B. All three are formatting or corpus artifacts, not fabrication:
+
+1. **Typographic separators — fixed.** `gpt-oss-120b` writes thousands with
+   U+202F (narrow no-break space), so a faithful `25 000` tokenised as `25` plus
+   `000`: two inventions reported for a copied value. Now normalised, along with
+   no-break and thin spaces. This alone accounted for most of the gap.
+2. **List enumerators — not fixed.** A summary written as `(1) … (2) … (3) …`
+   is flagged for indices that are structure, not claims. Models that format
+   with numbered lists score worse than models writing plain prose regardless of
+   faithfulness. Detecting these reliably means distinguishing `(2)` as an index
+   from `(0.21)` as a value, which is not safely automatable.
+3. **Source corruption — not fixable here.** `gs_en_20` lost its subscripts in
+   text extraction and reads `pCO23.4 kPa, pO211.7 kPa, HCO319.5 mmol/L` and
+   `SO294%`. A model that correctly recovers pCO₂ 3.4, pO₂ 11.7, HCO₃ 19.5 and
+   SO₂ 94% is flagged for four inventions — **penalised for getting it right.**
+
+Together with the spelled-out-numeral case, that is four known false-positive
+modes. The metric is a screen that tells you where to look, never a verdict.
+Always read what it flagged before believing it.
+
 One data defect worth knowing: `OmissionRate` includes negative values (min
 −1.0), so it is not a clean rate. Treat it as an ordinal signal.
 
@@ -357,6 +435,8 @@ ground truth for factuality specifically.
 | `docsum/summarizer.py` | the RAG call, citation parsing, offset mapping |
 | `docsum/extractive.py` | key-free backend: selects source sentences verbatim |
 | `docsum/local.py` | local-GPU backend: generates prose, aligns spans after |
+| `docsum/remote.py` | Groq backend: same shape, hosted generation, rate-limit aware |
+| `docsum/grounding.py` | the alignment shared by the local and Groq backends |
 | `docsum/compare.py` | runs several backends over the same docs and scores them |
 | `docsum/validation.py` | correlates our metrics against 400 human judgements |
 | `docsum/report.py` | text / JSON / interactive HTML output |
